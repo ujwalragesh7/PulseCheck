@@ -13,3 +13,125 @@ body {
   background: #020617;
   color: white;
 }
+
+/* =========================================================
+   PULSECHECK PREMIUM DESIGN TOKENS
+   ========================================================= */
+
+:root {
+  --pc-bg: #f5f7fb;
+  --pc-surface: #ffffff;
+  --pc-surface-soft: #f8fafc;
+
+  --pc-input: #f7f9fc;
+  --pc-dropdown: rgba(255, 255, 255, 0.98);
+  --pc-select-active: #f4f8ff;
+
+  --pc-border: #e2e8f0;
+  --pc-border-hover: #cbd5e1;
+
+  --pc-text: #0f172a;
+  --pc-text-secondary: #334155;
+  --pc-muted: #64748b;
+
+  --pc-hover: #f1f5f9;
+  --pc-icon-bg: #eef3f9;
+
+  --pc-shadow:
+    0 12px 35px rgba(15, 23, 42, 0.08);
+
+  --pc-brand: #4c8dff;
+  --pc-success: #16b982;
+  --pc-danger: #ef5350;
+  --pc-warning: #e8a91b;
+}
+
+[data-theme="dark"] {
+  --pc-bg: #080b11;
+  --pc-surface: #10151e;
+  --pc-surface-soft: #121923;
+
+  --pc-input: #111827;
+  --pc-dropdown: rgba(17, 24, 39, 0.98);
+  --pc-select-active: #14233f;
+
+  --pc-border: #202938;
+  --pc-border-hover: #344158;
+
+  --pc-text: #edf2f8;
+  --pc-text-secondary: #c5ceda;
+  --pc-muted: #7d899c;
+
+  --pc-hover: #182131;
+  --pc-icon-bg: #182131;
+
+  --pc-shadow:
+    0 20px 55px rgba(0, 0, 0, 0.42);
+
+  --pc-brand: #4c8dff;
+  --pc-success: #34d399;
+  --pc-danger: #fb5b5b;
+  --pc-warning: #f2b84b;
+}
+
+html,
+body {
+  background: var(--pc-bg);
+  color: var(--pc-text);
+  transition:
+    background-color 180ms ease,
+    color 180ms ease;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+/* Premium dropdown animation */
+
+@keyframes pc-dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateY(-5px) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-in {
+  animation: pc-dropdown-in 150ms ease-out;
+}
+
+/* Premium scrollbar */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--pc-border-hover) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--pc-border-hover);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--pc-muted);
+}
