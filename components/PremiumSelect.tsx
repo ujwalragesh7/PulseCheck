@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 type Option = {
   value: string;
@@ -13,7 +13,7 @@ type PremiumSelectProps = {
   onChange: (value: string) => void;
   options: Option[];
   placeholder?: string;
-  icon?: React.ReactNode;
+  icon?: ReactNode;
   className?: string;
 };
 

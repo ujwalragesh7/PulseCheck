@@ -3,11 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Amplify } from "aws-amplify";
 import {
-  confirmSignUp,
   getCurrentUser,
-  signIn,
   signOut,
-  signUp,
 } from "aws-amplify/auth";
 import { generateClient } from "aws-amplify/data";
 import { Inter, IBM_Plex_Mono } from "next/font/google";
@@ -36,7 +33,6 @@ const mono = IBM_Plex_Mono({
    ============================================================ */
 
 type Theme = "dark" | "light";
-type AuthMode = "signin" | "signup";
 type DashboardFilter = "all" | "up" | "down" | "unknown" | "disabled";
 
 type SelectOption = {
@@ -508,27 +504,13 @@ function PremiumSelect({
       )}
     </div>
   );
-}
-
-/* ============================================================
-   MAIN APP
-   ============================================================ */
-
-export default function Home() {
+}export default function Home() {
   /* ----------------------------------------------------------
-     AUTH
+     AUTH GUARD
      ---------------------------------------------------------- */
 
   const [authReady, setAuthReady] = useState(false);
   const [user, setUser] = useState(false);
-
-  const [authMode, setAuthMode] = useState<AuthMode>("signin");
-
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [code, setCode] = useState("");
-
-  const [confirming, setConfirming] = useState(false);
 
   /* ----------------------------------------------------------
      DATA
@@ -559,10 +541,34 @@ export default function Home() {
 
   const [clock, setClock] = useState<Date | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
-
+  const [platformRunning, setPlatformRunning] = useState(true);
+  const [platformMessage, setPlatformMessage] = useState("");
+  const [platformLoaded, setPlatformLoaded] = useState(false);
   /* ----------------------------------------------------------
      LOAD MONITORS
      ---------------------------------------------------------- */
+
+  const loadPlatformStatus = useCallback(async () => {
+    try {
+      const { data, errors } = await client.queries.platformStatus();
+
+      if (errors?.length) {
+        throw new Error(errors[0]?.message ?? "Could not load platform status.");
+      }
+
+      setPlatformRunning(data?.monitoringEnabled ?? true);
+      setPlatformMessage(data?.message ?? "");
+    } catch (error) {
+      console.error("Could not load platform status:", error);
+      // Fail closed for write operations if the global control cannot be read.
+      setPlatformRunning(false);
+      setPlatformMessage(
+        "PulseCheck platform status is temporarily unavailable. Monitoring changes are disabled until the service is available again.",
+      );
+    } finally {
+      setPlatformLoaded(true);
+    }
+  }, []);
 
   const loadMonitors = useCallback(async () => {
     setLoadingMonitors(true);
@@ -600,11 +606,13 @@ export default function Home() {
         if (!mounted) return;
 
         setUser(true);
+        await loadPlatformStatus();
         await loadMonitors();
       } catch {
         if (!mounted) return;
 
         setUser(false);
+        window.location.replace("/login");
       } finally {
         if (mounted) {
           setAuthReady(true);
@@ -617,7 +625,7 @@ export default function Home() {
     return () => {
       mounted = false;
     };
-  }, [loadMonitors]);
+  }, [loadMonitors, loadPlatformStatus]);
 
   /* ----------------------------------------------------------
      AUTO REFRESH
@@ -628,12 +636,13 @@ export default function Home() {
 
     const timer = window.setInterval(() => {
       void loadMonitors();
+      void loadPlatformStatus();
     }, 15000);
 
     return () => {
       window.clearInterval(timer);
     };
-  }, [user, loadMonitors]);
+  }, [user, loadMonitors, loadPlatformStatus]);
 
   /* ----------------------------------------------------------
      CLOCK
@@ -706,87 +715,9 @@ export default function Home() {
   }
 
   /* ----------------------------------------------------------
-     AUTHENTICATION
+  /* ----------------------------------------------------------
+     LOGOUT
      ---------------------------------------------------------- */
-
-  async function authenticate() {
-    if (!email.trim() || !password) {
-      setMessage("Enter your email and password.");
-      return;
-    }
-
-    setLoading(true);
-    setMessage("");
-
-    try {
-      if (authMode === "signup") {
-        const result = await signUp({
-          username: email.trim(),
-          password,
-          options: {
-            userAttributes: {
-              email: email.trim(),
-            },
-          },
-        });
-
-        if (result.nextStep.signUpStep === "CONFIRM_SIGN_UP") {
-          setConfirming(true);
-          setMessage("Check your email for the verification code.");
-        } else {
-          setAuthMode("signin");
-          setMessage("Account created. Sign in now.");
-        }
-      } else {
-        await signIn({
-          username: email.trim(),
-          password,
-        });
-
-        setUser(true);
-        await loadMonitors();
-      }
-    } catch (error) {
-      setMessage(
-        error instanceof Error
-          ? error.message
-          : "Authentication failed."
-      );
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function verify() {
-    if (!code.trim()) {
-      setMessage("Enter the verification code.");
-      return;
-    }
-
-    setLoading(true);
-    setMessage("");
-
-    try {
-      await confirmSignUp({
-        username: email.trim(),
-        confirmationCode: code.trim(),
-      });
-
-      setConfirming(false);
-      setAuthMode("signin");
-      setCode("");
-
-      setMessage("Email verified. Sign in now.");
-    } catch (error) {
-      setMessage(
-        error instanceof Error
-          ? error.message
-          : "Verification failed."
-      );
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function logout() {
     try {
@@ -795,6 +726,7 @@ export default function Home() {
       setUser(false);
       setMonitors([]);
       setShowProfileMenu(false);
+      window.location.replace("/login");
     }
   }
 
@@ -803,6 +735,14 @@ export default function Home() {
      ---------------------------------------------------------- */
 
   async function addMonitor() {
+    if (!platformLoaded || !platformRunning) {
+      setMessage(
+        platformMessage ||
+          "PulseCheck is temporarily stopped. Contact support before creating a monitor.",
+      );
+      return;
+    }
+
     const cleanName = name.trim();
     const cleanUrl = url.trim();
 
@@ -867,6 +807,14 @@ export default function Home() {
      ---------------------------------------------------------- */
 
   async function deleteMonitor(id: string) {
+    if (!platformLoaded || !platformRunning) {
+      setMessage(
+        platformMessage ||
+          "PulseCheck is temporarily stopped. Monitoring changes are unavailable.",
+      );
+      return;
+    }
+
     const confirmed = window.confirm(
       "Delete this monitor permanently?"
     );
@@ -897,6 +845,14 @@ export default function Home() {
      ---------------------------------------------------------- */
 
   async function toggleMonitor(monitor: Monitor) {
+    if (!platformLoaded || !platformRunning) {
+      setMessage(
+        platformMessage ||
+          "PulseCheck is temporarily stopped. Monitoring changes are unavailable.",
+      );
+      return;
+    }
+
     try {
       const { errors } = await client.models.Monitor.update({
         id: monitor.id,
@@ -1077,7 +1033,8 @@ export default function Home() {
   ];
 
   /* ============================================================
-     AUTH LOADING
+  /* ============================================================
+     AUTH GUARD
      ============================================================ */
 
   if (!authReady) {
@@ -1091,7 +1048,6 @@ export default function Home() {
               <span className="absolute h-3 w-3 rounded-full bg-[#4C8DFF] shadow-[0_0_20px_rgba(76,141,255,0.65)]" />
               <span className="absolute h-7 w-7 animate-spin rounded-full border border-transparent border-t-[#4C8DFF]" />
             </div>
-
             <p className="text-sm font-medium text-[var(--pc-muted)]">
               Loading PulseCheck…
             </p>
@@ -1101,278 +1057,9 @@ export default function Home() {
     );
   }
 
-  /* ============================================================
-     AUTH PAGE
-     ============================================================ */
-
   if (!user) {
-    return (
-      <main
-        className={`${inter.className} relative min-h-screen overflow-hidden bg-[var(--pc-bg)] text-[var(--pc-text)]`}
-      >
-        <div className="pointer-events-none absolute inset-0">
-          <div className="absolute left-[15%] top-[10%] h-72 w-72 rounded-full bg-[#4C8DFF]/8 blur-[100px]" />
-          <div className="absolute bottom-[5%] right-[10%] h-80 w-80 rounded-full bg-[#34D399]/6 blur-[110px]" />
-        </div>
-
-        <div className="relative mx-auto flex min-h-screen w-full max-w-6xl items-center justify-center px-5 py-10">
-          <div className="w-full max-w-[460px]">
-            <div className="mb-8 flex items-center justify-center gap-3">
-              <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-[#4C8DFF]/25 bg-[#4C8DFF]/10 text-[#4C8DFF]">
-                <Icon name="activity" size={21} strokeWidth={2} />
-              </div>
-
-              <div>
-                <p className="text-xl font-bold tracking-[-0.02em]">
-                  PulseCheck
-                </p>
-                <p
-                  className={`${mono.className} mt-1 text-[10px] uppercase tracking-[0.16em] text-[var(--pc-muted)]`}
-                >
-                  uptime intelligence
-                </p>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-6 shadow-[var(--pc-shadow)] sm:p-8">
-              <div className="mb-7">
-                <h1 className="text-2xl font-bold tracking-[-0.025em]">
-                  {confirming
-                    ? "Verify your account"
-                    : authMode === "signin"
-                      ? "Welcome back"
-                      : "Create your account"}
-                </h1>
-
-                <p className="mt-2 text-sm leading-6 text-[var(--pc-muted)]">
-                  {confirming
-                    ? "Enter the verification code sent to your email."
-                    : authMode === "signin"
-                      ? "Sign in to continue monitoring your services."
-                      : "Create your PulseCheck monitoring workspace."}
-                </p>
-              </div>
-
-              {!confirming && (
-                <div className="mb-6 flex rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] p-1">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthMode("signin");
-                      setMessage("");
-                    }}
-                    className={`flex-1 rounded-lg px-4 py-2.5 text-sm font-semibold transition-all ${
-                      authMode === "signin"
-                        ? "bg-[var(--pc-surface)] text-[var(--pc-text)] shadow-sm"
-                        : "text-[var(--pc-muted)] hover:text-[var(--pc-text)]"
-                    }`}
-                  >
-                    Sign in
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthMode("signup");
-                      setMessage("");
-                    }}
-                    className={`flex-1 rounded-lg px-4 py-2.5 text-sm font-semibold transition-all ${
-                      authMode === "signup"
-                        ? "bg-[var(--pc-surface)] text-[var(--pc-text)] shadow-sm"
-                        : "text-[var(--pc-muted)] hover:text-[var(--pc-text)]"
-                    }`}
-                  >
-                    Create account
-                  </button>
-                </div>
-              )}
-
-              {confirming ? (
-                <>
-                  <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
-                    Verification code
-                  </label>
-
-                  <input
-                    autoFocus
-                    value={code}
-                    onChange={(event) =>
-                      setCode(event.target.value)
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        void verify();
-                      }
-                    }}
-                    className="w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3.5 text-center text-lg tracking-[0.25em] outline-none transition-all placeholder:tracking-normal focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10"
-                    placeholder="000000"
-                  />
-
-                  <button
-                    type="button"
-                    onClick={() => void verify()}
-                    disabled={loading}
-                    className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 py-3.5 text-sm font-bold text-white shadow-[0_8px_25px_rgba(76,141,255,0.22)] transition-all hover:-translate-y-0.5 hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {loading ? "Verifying…" : "Verify email"}
-                    {!loading && <Icon name="arrow" size={17} />}
-                  </button>
-                </>
-              ) : (
-                <>
-                  <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
-                    Email address
-                  </label>
-
-                  <input
-                    value={email}
-                    onChange={(event) =>
-                      setEmail(event.target.value)
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        void authenticate();
-                      }
-                    }}
-                    className="mb-5 w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3.5 text-sm outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10"
-                    placeholder="you@example.com"
-                    type="email"
-                  />
-
-                  <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
-                    Password
-                  </label>
-
-                  <input
-                    value={password}
-                    onChange={(event) =>
-                      setPassword(event.target.value)
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        void authenticate();
-                      }
-                    }}
-                    className="w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3.5 text-sm outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10"
-                    placeholder="Enter your password"
-                    type="password"
-                  />
-
-                  <button
-                    type="button"
-                    onClick={() => void authenticate()}
-                    disabled={loading}
-                    className="mt-6 flex w-full items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 py-3.5 text-sm font-bold text-white shadow-[0_8px_25px_rgba(76,141,255,0.22)] transition-all hover:-translate-y-0.5 hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {loading
-                      ? "Please wait…"
-                      : authMode === "signin"
-                        ? "Sign in"
-                        : "Create account"}
-
-                    {!loading && <Icon name="arrow" size={17} />}
-                  </button>
-                </>
-              )}
-
-              {message && (
-                <div className="mt-5 rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3 text-center text-sm leading-5 text-[var(--pc-muted)]">
-                  {message}
-                </div>
-              )}
-            </div>
-
-            <div className="mt-6 flex items-center justify-center gap-2 text-[11px] text-[var(--pc-muted)]">
-              <Icon name="shield" size={13} />
-              Secure cloud-based monitoring
-            </div>
-          </div>
-        </div>
-
-        <style jsx global>{`
-          :root {
-            --pc-bg: #080b11;
-            --pc-surface: #10151e;
-            --pc-surface-soft: #121923;
-            --pc-input: #111827;
-            --pc-dropdown: rgba(17, 24, 39, 0.98);
-            --pc-select-active: #14233f;
-            --pc-border: #202938;
-            --pc-border-hover: #344158;
-            --pc-text: #edf2f8;
-            --pc-muted: #7d899c;
-            --pc-hover: #182131;
-            --pc-icon-bg: #182131;
-            --pc-shadow: 0 25px 70px rgba(0, 0, 0, 0.35);
-          }
-
-          html[data-theme="light"] {
-            --pc-bg: #f5f7fb;
-            --pc-surface: #ffffff;
-            --pc-surface-soft: #f8fafc;
-            --pc-input: #f7f9fc;
-            --pc-dropdown: rgba(255, 255, 255, 0.98);
-            --pc-select-active: #f4f8ff;
-            --pc-border: #e2e8f0;
-            --pc-border-hover: #cbd5e1;
-            --pc-text: #0f172a;
-            --pc-muted: #64748b;
-            --pc-hover: #f1f5f9;
-            --pc-icon-bg: #eef3f9;
-            --pc-shadow: 0 20px 60px rgba(15, 23, 42, 0.10);
-          }
-
-          @keyframes pcDropdown {
-            from {
-              opacity: 0;
-              transform: translateY(-5px) scale(0.985);
-            }
-
-            to {
-              opacity: 1;
-              transform: translateY(0) scale(1);
-            }
-          }
-
-          * {
-            box-sizing: border-box;
-          }
-
-          body {
-            margin: 0;
-            background: var(--pc-bg);
-            color: var(--pc-text);
-            transition:
-              background-color 180ms ease,
-              color 180ms ease;
-          }
-
-          * {
-            scrollbar-width: thin;
-            scrollbar-color: var(--pc-border-hover) transparent;
-          }
-
-          *::-webkit-scrollbar {
-            width: 7px;
-            height: 7px;
-          }
-
-          *::-webkit-scrollbar-track {
-            background: transparent;
-          }
-
-          *::-webkit-scrollbar-thumb {
-            background: var(--pc-border-hover);
-            border-radius: 999px;
-          }
-        `}</style>
-      </main>
-    );
+    return null;
   }
-
-  /* ============================================================
-     DASHBOARD
-     ============================================================ */
 
   return (
     <main
@@ -1427,11 +1114,7 @@ export default function Home() {
               disabled={loadingMonitors}
               className="hidden h-10 items-center gap-2 rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] px-3.5 text-sm font-medium text-[var(--pc-muted)] transition-all hover:border-[var(--pc-border-hover)] hover:text-[var(--pc-text)] disabled:opacity-50 sm:flex"
             >
-              <Icon
-                name="refresh"
-                size={16}
-                className=""
-              />
+              <Icon name="refresh" size={16} />
               <span>
                 {loadingMonitors
                   ? "Refreshing"
@@ -1524,6 +1207,23 @@ export default function Home() {
           ======================================================== */}
 
       <div className="mx-auto w-full max-w-[1500px] px-5 pb-16 pt-7 sm:px-7 xl:px-10">
+        {!platformRunning && (
+          <section className="mb-4 flex flex-col gap-3 rounded-2xl border border-[#FB5B5B]/25 bg-[#FB5B5B]/[0.045] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-[#FB5B5B] shadow-[0_0_14px_rgba(251,91,91,0.55)]" />
+              <div>
+                <p className="text-sm font-bold text-[#FF8585]">PulseCheck is temporarily stopped</p>
+                <p className="mt-1 text-xs leading-5 text-[var(--pc-muted)]">
+                  {platformMessage || "Monitoring and new monitoring operations are currently unavailable. Please try again later or contact support."}
+                </p>
+              </div>
+            </div>
+            <span className="shrink-0 rounded-lg border border-[#FB5B5B]/20 bg-[#FB5B5B]/8 px-3 py-2 text-[11px] font-semibold text-[#FF9B9B]">
+              View-only mode
+            </span>
+          </section>
+        )}
+
         {/* HERO */}
 
         <section
@@ -1587,10 +1287,18 @@ export default function Home() {
             <button
               type="button"
               onClick={() => {
+                if (!platformRunning) {
+                  setMessage(
+                    platformMessage ||
+                      "PulseCheck is temporarily stopped. Contact support before creating a monitor.",
+                  );
+                  return;
+                }
                 setMessage("");
                 setShowAdd(true);
               }}
-              className="flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 text-sm font-bold text-white shadow-[0_8px_25px_rgba(76,141,255,0.18)] transition-all hover:-translate-y-0.5 hover:bg-[#3E7CE8]"
+              disabled={!platformLoaded || !platformRunning}
+              className="flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 text-sm font-bold text-white shadow-[0_8px_25px_rgba(76,141,255,0.18)] transition-all hover:-translate-y-0.5 hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-45"
             >
               <Icon name="plus" size={17} strokeWidth={2.2} />
               Add monitor
@@ -1921,6 +1629,7 @@ export default function Home() {
                           onClick={() =>
                             void toggleMonitor(monitor)
                           }
+                          disabled={!platformLoaded || !platformRunning}
                           className="flex items-center gap-1.5 rounded-lg border border-[var(--pc-border)] px-2.5 py-1.5 text-[11px] font-semibold text-[var(--pc-muted)] transition-colors hover:border-[var(--pc-border-hover)] hover:text-[var(--pc-text)]"
                         >
                           <Icon
@@ -2149,7 +1858,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={() => void addMonitor()}
-                disabled={loading}
+                disabled={loading || !platformRunning}
                 className="flex h-11 items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 text-sm font-bold text-white transition-all hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Icon name="plus" size={16} />
@@ -2355,6 +2064,82 @@ export default function Home() {
           </div>
         </div>
       )}
+
+
+      <style jsx global>{`
+        :root {
+          --pc-bg: #080b11;
+          --pc-surface: #10151e;
+          --pc-surface-soft: #121923;
+          --pc-input: #111827;
+          --pc-dropdown: rgba(17, 24, 39, 0.98);
+          --pc-select-active: #14233f;
+          --pc-border: #202938;
+          --pc-border-hover: #344158;
+          --pc-text: #edf2f8;
+          --pc-muted: #7d899c;
+          --pc-hover: #182131;
+          --pc-icon-bg: #182131;
+          --pc-shadow: 0 25px 70px rgba(0, 0, 0, 0.35);
+        }
+
+        html[data-theme="light"] {
+          --pc-bg: #f5f7fb;
+          --pc-surface: #ffffff;
+          --pc-surface-soft: #f8fafc;
+          --pc-input: #f7f9fc;
+          --pc-dropdown: rgba(255, 255, 255, 0.98);
+          --pc-select-active: #f4f8ff;
+          --pc-border: #e2e8f0;
+          --pc-border-hover: #cbd5e1;
+          --pc-text: #0f172a;
+          --pc-muted: #64748b;
+          --pc-hover: #f1f5f9;
+          --pc-icon-bg: #eef3f9;
+          --pc-shadow: 0 20px 60px rgba(15, 23, 42, 0.10);
+        }
+
+        @keyframes pcDropdown {
+          from {
+            opacity: 0;
+            transform: translateY(-5px) scale(0.985);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+          }
+        }
+
+        * {
+          box-sizing: border-box;
+        }
+
+        body {
+          margin: 0;
+          background: var(--pc-bg);
+          color: var(--pc-text);
+          transition: background-color 180ms ease, color 180ms ease;
+        }
+
+        * {
+          scrollbar-width: thin;
+          scrollbar-color: var(--pc-border-hover) transparent;
+        }
+
+        *::-webkit-scrollbar {
+          width: 7px;
+          height: 7px;
+        }
+
+        *::-webkit-scrollbar-track {
+          background: transparent;
+        }
+
+        *::-webkit-scrollbar-thumb {
+          background: var(--pc-border-hover);
+          border-radius: 999px;
+        }
+      `}</style>
 
       {/* ========================================================
           FULLSCREEN INDICATOR
