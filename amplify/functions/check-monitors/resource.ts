@@ -4,6 +4,7 @@ export const checkMonitors = defineFunction({
   name: "check-monitors",
   entry: "./handler.ts",
   schedule: "every 1m",
+  timeoutSeconds: 60,
 
   /*
    * This function reads/writes Amplify Data.

@@ -1,6 +1,7 @@
 import { Amplify } from "aws-amplify";
 import { generateClient } from "aws-amplify/data";
 import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtime";
+import { env } from "$amplify/env/check-monitors";
 import {
   lookup,
   resolve4,
@@ -15,13 +16,8 @@ import tls from "node:tls";
 
 import type { Schema } from "../../data/resource";
 
-const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig({
-  AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID!,
-  AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY!,
-  AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN!,
-  AWS_REGION: process.env.AWS_REGION!,
-  AMPLIFY_DATA_DEFAULT_NAME: process.env.AMPLIFY_DATA_DEFAULT_NAME!,
-});
+const { resourceConfig, libraryOptions } =
+  await getAmplifyDataClientConfig(env);
 
 Amplify.configure(resourceConfig, libraryOptions);
 
