@@ -5,7 +5,6 @@ import {
 } from "@aws-amplify/backend";
 
 import { checkMonitors } from "../functions/check-monitors/resource";
-import { adminControl } from "../functions/admin-control/resource";
 
 const schema = a
   .schema({
@@ -13,6 +12,17 @@ const schema = a
       .model({
         name: a.string().required(),
         url: a.string().required(),
+        monitorType: a.string().default("HTTP"),
+        method: a.string().default("GET"),
+        expectedStatusCode: a.integer().default(200),
+        expectedBodyText: a.string(),
+        timeoutSeconds: a.integer().default(10),
+        port: a.integer(),
+        dnsRecordType: a.string().default("A"),
+        dnsExpectedValue: a.string(),
+        sslExpiryWarningDays: a.integer().default(14),
+        requestHeadersJson: a.string(),
+        requestBody: a.string(),
         status: a.string().default("UNKNOWN"),
         responseTime: a.integer(),
         statusCode: a.integer(),
@@ -56,16 +66,6 @@ const schema = a
       })
       .authorization((allow) => [allow.owner()]),
 
-    MonitoringSettings: a
-      .model({
-        monitoringEnabled: a.boolean().default(true),
-        uptimeWindowDays: a.integer().default(1),
-        platformMessage: a.string(),
-      })
-      .authorization((allow) => [
-        allow.authenticated().to(["read"]),
-      ]),
-
     UserActivity: a
       .model({
         action: a.string().required(),
@@ -75,70 +75,9 @@ const schema = a
       })
       .authorization((allow) => [allow.owner()]),
 
-    AdminOverview: a.customType({
-      platformRunning: a.boolean().required(),
-      platformMessage: a.string(),
-      uptimeWindowDays: a.integer().required(),
-      users: a.customType({
-        total: a.integer().required(),
-        active: a.integer().required(),
-        confirmed: a.integer().required(),
-        disabled: a.integer().required(),
-        newToday: a.integer().required(),
-        new7d: a.integer().required(),
-        new30d: a.integer().required(),
-        loginsToday: a.integer().required(),
-        logins7d: a.integer().required(),
-        logins30d: a.integer().required(),
-      }),
-      monitoring: a.customType({
-        total: a.integer().required(),
-        healthy: a.integer().required(),
-        down: a.integer().required(),
-        disabled: a.integer().required(),
-        active: a.integer().required(),
-        openIncidents: a.integer().required(),
-        averageResponseTime: a.integer().required(),
-      }),
-      generatedAt: a.datetime().required(),
-    }),
-
-    PlatformStatus: a.customType({
-      monitoringEnabled: a.boolean().required(),
-      uptimeWindowDays: a.integer().required(),
-      message: a.string(),
-    }),
-
-    PlatformControlResult: a.customType({
-      monitoringEnabled: a.boolean().required(),
-      message: a.string(),
-    }),
-
-    adminOverview: a
-      .query()
-      .returns(a.ref("AdminOverview"))
-      .authorization((allow) => [allow.groups(["ADMINS"])])
-      .handler(a.handler.function(adminControl)),
-
-    platformStatus: a
-      .query()
-      .returns(a.ref("PlatformStatus"))
-      .authorization((allow) => [allow.authenticated()])
-      .handler(a.handler.function(adminControl)),
-
-    setPlatformState: a
-      .mutation()
-      .arguments({
-        enabled: a.boolean().required(),
-        message: a.string(),
-      })
-      .returns(a.ref("PlatformControlResult"))
-      .authorization((allow) => [allow.groups(["ADMINS"])])
-      .handler(a.handler.function(adminControl)),
   })
   .authorization((allow) => [
     allow.resource(checkMonitors),
-    allow.resource(adminControl),
   ]);
 
 export type Schema = ClientSchema<typeof schema>;

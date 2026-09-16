@@ -1,22 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Amplify } from "aws-amplify";
 import {
   getCurrentUser,
   signOut,
 } from "aws-amplify/auth";
-import { generateClient } from "aws-amplify/data";
 import { Inter, IBM_Plex_Mono } from "next/font/google";
 
-import outputs from "../amplify_outputs.json";
 import type { Schema } from "../amplify/data/resource";
-
-Amplify.configure(outputs);
-
-const client = generateClient<Schema>();
+import { client } from "./amplify-client";
 
 type Monitor = Schema["Monitor"]["type"];
+type MonitorCheck = Schema["MonitorCheck"]["type"];
+type Incident = Schema["Incident"]["type"];
 
 const inter = Inter({
   subsets: ["latin"],
@@ -34,6 +30,7 @@ const mono = IBM_Plex_Mono({
 
 type Theme = "dark" | "light";
 type DashboardFilter = "all" | "up" | "down" | "unknown" | "disabled";
+type SortMode = "status" | "name" | "response" | "recent";
 
 type SelectOption = {
   value: string;
@@ -73,7 +70,8 @@ function Icon({
     | "more"
     | "expand"
     | "x"
-    | "arrow";
+    | "arrow"
+    | "eye";
   size?: number;
   strokeWidth?: number;
 }) {
@@ -267,6 +265,14 @@ function Icon({
         </svg>
       );
 
+    case "eye":
+      return (
+        <svg {...common}>
+          <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+          <circle cx="12" cy="12" r="3" />
+        </svg>
+      );
+
     default:
       return null;
   }
@@ -307,6 +313,20 @@ function formatResponse(value?: number | null) {
   return `${value} ms`;
 }
 
+function formatDuration(seconds?: number | null) {
+  if (seconds == null) return "ongoing";
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+
+  const days = Math.round(hours / 24);
+  return `${days}d`;
+}
+
 function statusRank(monitor: Monitor) {
   if (!monitor.enabled) return 4;
   if (monitor.status === "DOWN") return 0;
@@ -321,6 +341,78 @@ function getStatus(monitor: Monitor) {
   if (monitor.status === "DOWN") return "down";
 
   return "unknown";
+}
+
+// Uptime % computed from real check records inside a time window — not a
+// stored/stale field, so it only ever reflects what was actually observed.
+function uptimeForWindow(checks: MonitorCheck[], hours: number) {
+  const cutoff = Date.now() - hours * 60 * 60 * 1000;
+  const inWindow = checks.filter(
+    (check) => new Date(check.checkedAt).getTime() >= cutoff
+  );
+
+  if (inWindow.length === 0) return null;
+
+  const up = inWindow.filter((check) => check.status === "UP").length;
+  return Math.round((up / inWindow.length) * 1000) / 10;
+}
+
+/* ============================================================
+   RESPONSE TIME CHART
+   ============================================================ */
+
+function ResponseTimeChart({
+  points,
+}: {
+  points: { y: number | null }[];
+}) {
+  const valid = points.filter((p) => p.y != null) as { y: number }[];
+
+  if (valid.length < 2) {
+    return (
+      <div className="flex h-32 items-center justify-center text-xs text-[var(--pc-muted)]">
+        Not enough data yet — check back after a few more checks run.
+      </div>
+    );
+  }
+
+  const width = 560;
+  const height = 120;
+  const maxY = Math.max(...valid.map((p) => p.y));
+  const minY = Math.min(...valid.map((p) => p.y));
+  const range = maxY - minY || 1;
+  const stepX = width / Math.max(points.length - 1, 1);
+
+  let path = "";
+  points.forEach((point, index) => {
+    if (point.y == null) return;
+    const x = index * stepX;
+    const y = height - ((point.y - minY) / range) * (height - 20) - 10;
+    path += `${path === "" ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)} `;
+  });
+
+  return (
+    <div>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="h-32 w-full"
+        preserveAspectRatio="none"
+      >
+        <path
+          d={path}
+          fill="none"
+          stroke="#4C8DFF"
+          strokeWidth={2}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+      <div className="mt-1 flex justify-between text-[10px] text-[var(--pc-muted)]">
+        <span>{minY}ms</span>
+        <span>{maxY}ms</span>
+      </div>
+    </div>
+  );
 }
 
 /* ============================================================
@@ -504,7 +596,9 @@ function PremiumSelect({
       )}
     </div>
   );
-}export default function Home() {
+}
+
+export default function Home() {
   /* ----------------------------------------------------------
      AUTH GUARD
      ---------------------------------------------------------- */
@@ -531,44 +625,104 @@ function PremiumSelect({
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<DashboardFilter>("all");
+  const [sortMode, setSortMode] = useState<SortMode>("status");
+  const [autoRefresh, setAutoRefresh] = useState(true);
 
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [checkInterval, setCheckInterval] = useState("5");
+  const [monitorType, setMonitorType] = useState("HTTP");
+  const [method, setMethod] = useState("GET");
+  const [expectedStatusCode, setExpectedStatusCode] = useState("200");
+  const [expectedBodyText, setExpectedBodyText] = useState("");
+  const [timeoutSeconds, setTimeoutSeconds] = useState("10");
+  const [port, setPort] = useState("");
+  const [dnsRecordType, setDnsRecordType] = useState("A");
+  const [dnsExpectedValue, setDnsExpectedValue] = useState("");
+  const [sslExpiryWarningDays, setSslExpiryWarningDays] = useState("14");
+  const [requestHeadersJson, setRequestHeadersJson] = useState("");
+  const [requestBody, setRequestBody] = useState("");
+
+  const [editMonitor, setEditMonitor] = useState<Monitor | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editUrl, setEditUrl] = useState("");
+  const [editCheckInterval, setEditCheckInterval] = useState("5");
+  const [editMonitorType, setEditMonitorType] = useState("HTTP");
+  const [editMethod, setEditMethod] = useState("GET");
+  const [editExpectedStatusCode, setEditExpectedStatusCode] = useState("200");
+  const [editExpectedBodyText, setEditExpectedBodyText] = useState("");
+  const [editTimeoutSeconds, setEditTimeoutSeconds] = useState("10");
+  const [editPort, setEditPort] = useState("");
+  const [editDnsRecordType, setEditDnsRecordType] = useState("A");
+  const [editDnsExpectedValue, setEditDnsExpectedValue] = useState("");
+  const [editSslExpiryWarningDays, setEditSslExpiryWarningDays] = useState("14");
+  const [editRequestHeadersJson, setEditRequestHeadersJson] = useState("");
+  const [editRequestBody, setEditRequestBody] = useState("");
 
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
 
   const [clock, setClock] = useState<Date | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
-  const [platformRunning, setPlatformRunning] = useState(true);
-  const [platformMessage, setPlatformMessage] = useState("");
-  const [platformLoaded, setPlatformLoaded] = useState(false);
+
+  /* ----------------------------------------------------------
+     MONITOR DETAIL DRAWER
+     ---------------------------------------------------------- */
+
+  const [viewMonitor, setViewMonitor] = useState<Monitor | null>(null);
+  const [checksHistory, setChecksHistory] = useState<MonitorCheck[]>([]);
+  const [incidentsHistory, setIncidentsHistory] = useState<Incident[]>([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  async function openDetail(monitor: Monitor) {
+    setViewMonitor(monitor);
+    setDetailLoading(true);
+
+    try {
+      const [{ data: checks, errors: checkErrors }, { data: incidents, errors: incidentErrors }] =
+        await Promise.all([
+          client.models.MonitorCheck.list({
+            filter: { monitorId: { eq: monitor.id } },
+            limit: 200,
+          }),
+          client.models.Incident.list({
+            filter: { monitorId: { eq: monitor.id } },
+            limit: 50,
+          }),
+        ]);
+
+      if (checkErrors?.length) throw new Error(checkErrors[0].message);
+      if (incidentErrors?.length) throw new Error(incidentErrors[0].message);
+
+      setChecksHistory(
+        [...checks].sort(
+          (a, b) => new Date(b.checkedAt).getTime() - new Date(a.checkedAt).getTime()
+        )
+      );
+      setIncidentsHistory(
+        [...incidents].sort(
+          (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+        )
+      );
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Could not load monitor history."
+      );
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
+  function closeDetail() {
+    setViewMonitor(null);
+    setChecksHistory([]);
+    setIncidentsHistory([]);
+  }
+
   /* ----------------------------------------------------------
      LOAD MONITORS
      ---------------------------------------------------------- */
 
-  const loadPlatformStatus = useCallback(async () => {
-    try {
-      const { data, errors } = await client.queries.platformStatus();
-
-      if (errors?.length) {
-        throw new Error(errors[0]?.message ?? "Could not load platform status.");
-      }
-
-      setPlatformRunning(data?.monitoringEnabled ?? true);
-      setPlatformMessage(data?.message ?? "");
-    } catch (error) {
-      console.error("Could not load platform status:", error);
-      // Fail closed for write operations if the global control cannot be read.
-      setPlatformRunning(false);
-      setPlatformMessage(
-        "PulseCheck platform status is temporarily unavailable. Monitoring changes are disabled until the service is available again.",
-      );
-    } finally {
-      setPlatformLoaded(true);
-    }
-  }, []);
 
   const loadMonitors = useCallback(async () => {
     setLoadingMonitors(true);
@@ -601,22 +755,34 @@ function PremiumSelect({
 
     async function initializeAuth() {
       try {
+        /*
+         * Cognito is the source of truth for authentication.
+         * Do not call claimSession() here. The previous implementation
+         * could reject a valid Cognito login and redirect back to /login.
+         */
         await getCurrentUser();
 
+      } catch (error) {
         if (!mounted) return;
 
-        setUser(true);
-        await loadPlatformStatus();
-        await loadMonitors();
-      } catch {
-        if (!mounted) return;
-
+        console.error("No valid Cognito session:", error);
         setUser(false);
         window.location.replace("/login");
-      } finally {
-        if (mounted) {
-          setAuthReady(true);
-        }
+        return;
+      }
+
+      if (!mounted) return;
+
+      setUser(true);
+
+      /*
+       * These calls load dashboard data only. Their own error handlers
+       * display data/API problems without destroying the Cognito session.
+       */
+      await loadMonitors();
+
+      if (mounted) {
+        setAuthReady(true);
       }
     }
 
@@ -625,24 +791,34 @@ function PremiumSelect({
     return () => {
       mounted = false;
     };
-  }, [loadMonitors, loadPlatformStatus]);
+  }, [loadMonitors]);
+
+  /* ----------------------------------------------------------
+     AUTH SESSION
+     ---------------------------------------------------------- */
+
+  /*
+   * Cognito owns the browser authentication session.
+   * The old claimSession()/validateSession() polling loop has deliberately
+   * been removed. It was causing the successful login -> / -> /login loop.
+   * Dashboard data continues to refresh automatically below.
+   */
 
   /* ----------------------------------------------------------
      AUTO REFRESH
      ---------------------------------------------------------- */
 
   useEffect(() => {
-    if (!user) return;
+    if (!user || !autoRefresh) return;
 
     const timer = window.setInterval(() => {
       void loadMonitors();
-      void loadPlatformStatus();
     }, 15000);
 
     return () => {
       window.clearInterval(timer);
     };
-  }, [user, loadMonitors, loadPlatformStatus]);
+  }, [user, autoRefresh, loadMonitors]);
 
   /* ----------------------------------------------------------
      CLOCK
@@ -681,40 +857,29 @@ function PremiumSelect({
   }
 
   /* ----------------------------------------------------------
-     FULLSCREEN
+     NOC VIEW MODE
      ---------------------------------------------------------- */
 
-  useEffect(() => {
-    function onFullscreenChange() {
-      setFullscreen(Boolean(document.fullscreenElement));
-    }
-
-    document.addEventListener(
-      "fullscreenchange",
-      onFullscreenChange
-    );
-
-    return () => {
-      document.removeEventListener(
-        "fullscreenchange",
-        onFullscreenChange
-      );
-    };
-  }, []);
-
-  async function toggleFullscreen() {
-    try {
-      if (document.fullscreenElement) {
-        await document.exitFullscreen();
-      } else {
-        await document.documentElement.requestFullscreen();
-      }
-    } catch {
-      setMessage("Fullscreen is not available in this browser.");
-    }
+  function toggleFullscreen() {
+    setFullscreen((current) => !current);
+    setShowAdd(false);
+    setEditMonitor(null);
+    setShowSettings(false);
+    setShowProfileMenu(false);
+    setViewMonitor(null);
   }
 
-  /* ----------------------------------------------------------
+  useEffect(() => {
+    if (!fullscreen) return;
+
+    function handleViewModeKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setFullscreen(false);
+    }
+
+    window.addEventListener("keydown", handleViewModeKey);
+    return () => window.removeEventListener("keydown", handleViewModeKey);
+  }, [fullscreen]);
+
   /* ----------------------------------------------------------
      LOGOUT
      ---------------------------------------------------------- */
@@ -723,6 +888,9 @@ function PremiumSelect({
     try {
       await signOut();
     } finally {
+      window.sessionStorage.removeItem(
+        "pulsecheck-session-id",
+      );
       setUser(false);
       setMonitors([]);
       setShowProfileMenu(false);
@@ -735,13 +903,6 @@ function PremiumSelect({
      ---------------------------------------------------------- */
 
   async function addMonitor() {
-    if (!platformLoaded || !platformRunning) {
-      setMessage(
-        platformMessage ||
-          "PulseCheck is temporarily stopped. Contact support before creating a monitor.",
-      );
-      return;
-    }
 
     const cleanName = name.trim();
     const cleanUrl = url.trim();
@@ -768,9 +929,33 @@ function PremiumSelect({
       setLoading(true);
       setMessage("");
 
+      const normalizedType = monitorType.toUpperCase();
+      if (!["HTTP", "API", "TCP", "DNS", "SSL"].includes(normalizedType)) {
+        throw new Error("Select a supported monitor type.");
+      }
+
+      if (["HTTP", "API"].includes(normalizedType) && !cleanUrl.match(/^https?:\/\//i)) {
+        throw new Error("HTTP and API monitors require an HTTP or HTTPS URL.");
+      }
+
+      if (normalizedType === "TCP" && (!port || Number(port) < 1 || Number(port) > 65535)) {
+        throw new Error("TCP monitors require a valid port from 1 to 65535.");
+      }
+
       const { errors } = await client.models.Monitor.create({
         name: cleanName,
         url: cleanUrl,
+        monitorType: normalizedType,
+        method: method.toUpperCase(),
+        expectedStatusCode: Number(expectedStatusCode) || 200,
+        expectedBodyText: expectedBodyText.trim() || undefined,
+        timeoutSeconds: Math.min(60, Math.max(2, Number(timeoutSeconds) || 10)),
+        port: port ? Number(port) : undefined,
+        dnsRecordType: dnsRecordType.toUpperCase(),
+        dnsExpectedValue: dnsExpectedValue.trim() || undefined,
+        sslExpiryWarningDays: Math.max(1, Number(sslExpiryWarningDays) || 14),
+        requestHeadersJson: requestHeadersJson.trim() || undefined,
+        requestBody: requestBody || undefined,
         status: "UNKNOWN",
         enabled: true,
         checkInterval: Number(checkInterval),
@@ -783,6 +968,17 @@ function PremiumSelect({
       setName("");
       setUrl("");
       setCheckInterval("5");
+      setMonitorType("HTTP");
+      setMethod("GET");
+      setExpectedStatusCode("200");
+      setExpectedBodyText("");
+      setTimeoutSeconds("10");
+      setPort("");
+      setDnsRecordType("A");
+      setDnsExpectedValue("");
+      setSslExpiryWarningDays("14");
+      setRequestHeadersJson("");
+      setRequestBody("");
 
       setShowAdd(false);
 
@@ -807,13 +1003,6 @@ function PremiumSelect({
      ---------------------------------------------------------- */
 
   async function deleteMonitor(id: string) {
-    if (!platformLoaded || !platformRunning) {
-      setMessage(
-        platformMessage ||
-          "PulseCheck is temporarily stopped. Monitoring changes are unavailable.",
-      );
-      return;
-    }
 
     const confirmed = window.confirm(
       "Delete this monitor permanently?"
@@ -830,6 +1019,8 @@ function PremiumSelect({
         throw new Error(errors[0].message);
       }
 
+      if (viewMonitor?.id === id) closeDetail();
+
       await loadMonitors();
     } catch (error) {
       setMessage(
@@ -845,13 +1036,6 @@ function PremiumSelect({
      ---------------------------------------------------------- */
 
   async function toggleMonitor(monitor: Monitor) {
-    if (!platformLoaded || !platformRunning) {
-      setMessage(
-        platformMessage ||
-          "PulseCheck is temporarily stopped. Monitoring changes are unavailable.",
-      );
-      return;
-    }
 
     try {
       const { errors } = await client.models.Monitor.update({
@@ -871,6 +1055,252 @@ function PremiumSelect({
           : "Could not update monitor."
       );
     }
+  }
+
+  /* ----------------------------------------------------------
+     EDIT MONITOR
+     ---------------------------------------------------------- */
+
+  function beginEditMonitor(monitor: Monitor) {
+    setEditMonitor(monitor);
+    setEditName(monitor.name);
+    setEditUrl(monitor.url);
+    setEditCheckInterval(String(monitor.checkInterval ?? 5));
+    setEditMonitorType(String(monitor.monitorType ?? "HTTP"));
+    setEditMethod(String(monitor.method ?? "GET"));
+    setEditExpectedStatusCode(String(monitor.expectedStatusCode ?? 200));
+    setEditExpectedBodyText(monitor.expectedBodyText ?? "");
+    setEditTimeoutSeconds(String(monitor.timeoutSeconds ?? 10));
+    setEditPort(monitor.port == null ? "" : String(monitor.port));
+    setEditDnsRecordType(String(monitor.dnsRecordType ?? "A"));
+    setEditDnsExpectedValue(monitor.dnsExpectedValue ?? "");
+    setEditSslExpiryWarningDays(String(monitor.sslExpiryWarningDays ?? 14));
+    setEditRequestHeadersJson(monitor.requestHeadersJson ?? "");
+    setEditRequestBody(monitor.requestBody ?? "");
+    setMessage("");
+  }
+
+  async function saveEditMonitor() {
+    if (!editMonitor) return;
+
+
+    const cleanName = editName.trim();
+    const cleanUrl = editUrl.trim();
+
+    if (!cleanName) {
+      setMessage("Enter a monitor name.");
+      return;
+    }
+
+    if (!cleanUrl) {
+      setMessage("Enter a monitor URL.");
+      return;
+    }
+
+    try {
+      const parsed = new URL(cleanUrl);
+
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        throw new Error("Only HTTP and HTTPS URLs are supported.");
+      }
+
+      setLoading(true);
+      setMessage("");
+
+      const normalizedType = editMonitorType.toUpperCase();
+      if (!["HTTP", "API", "TCP", "DNS", "SSL"].includes(normalizedType)) {
+        throw new Error("Select a supported monitor type.");
+      }
+
+      if (["HTTP", "API"].includes(normalizedType) && !cleanUrl.match(/^https?:\/\//i)) {
+        throw new Error("HTTP and API monitors require an HTTP or HTTPS URL.");
+      }
+
+      if (normalizedType === "TCP" && (!editPort || Number(editPort) < 1 || Number(editPort) > 65535)) {
+        throw new Error("TCP monitors require a valid port from 1 to 65535.");
+      }
+
+      const { errors } = await client.models.Monitor.update({
+        id: editMonitor.id,
+        name: cleanName,
+        url: cleanUrl,
+        monitorType: normalizedType,
+        method: editMethod.toUpperCase(),
+        expectedStatusCode: Number(editExpectedStatusCode) || 200,
+        expectedBodyText: editExpectedBodyText.trim() || undefined,
+        timeoutSeconds: Math.min(60, Math.max(2, Number(editTimeoutSeconds) || 10)),
+        port: editPort ? Number(editPort) : undefined,
+        dnsRecordType: editDnsRecordType.toUpperCase(),
+        dnsExpectedValue: editDnsExpectedValue.trim() || undefined,
+        sslExpiryWarningDays: Math.max(1, Number(editSslExpiryWarningDays) || 14),
+        requestHeadersJson: editRequestHeadersJson.trim() || undefined,
+        requestBody: editRequestBody || undefined,
+        checkInterval: Number(editCheckInterval),
+      });
+
+      if (errors?.length) {
+        throw new Error(errors[0].message);
+      }
+
+      setEditMonitor(null);
+      await loadMonitors();
+
+      if (viewMonitor?.id === editMonitor.id) {
+        const updated = {
+          ...viewMonitor,
+          name: cleanName,
+          url: cleanUrl,
+          checkInterval: Number(editCheckInterval),
+          monitorType: normalizedType,
+          method: editMethod.toUpperCase(),
+          expectedStatusCode: Number(editExpectedStatusCode) || 200,
+          expectedBodyText: editExpectedBodyText.trim() || undefined,
+          timeoutSeconds: Math.min(60, Math.max(2, Number(editTimeoutSeconds) || 10)),
+          port: editPort ? Number(editPort) : undefined,
+          dnsRecordType: editDnsRecordType.toUpperCase(),
+          dnsExpectedValue: editDnsExpectedValue.trim() || undefined,
+          sslExpiryWarningDays: Math.max(1, Number(editSslExpiryWarningDays) || 14),
+          requestHeadersJson: editRequestHeadersJson.trim() || undefined,
+          requestBody: editRequestBody || undefined,
+        };
+
+        setViewMonitor(updated);
+      }
+
+      setMessage("Monitor updated successfully.");
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Could not update monitor.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /* ----------------------------------------------------------
+     DUPLICATE MONITOR
+     ---------------------------------------------------------- */
+
+  async function duplicateMonitor(monitor: Monitor) {
+
+    try {
+      setLoading(true);
+      setMessage("");
+
+      const { errors } = await client.models.Monitor.create({
+        name: `${monitor.name} (Copy)`,
+        url: monitor.url,
+        monitorType: monitor.monitorType ?? "HTTP",
+        method: monitor.method ?? "GET",
+        expectedStatusCode: monitor.expectedStatusCode ?? 200,
+        expectedBodyText: monitor.expectedBodyText,
+        timeoutSeconds: monitor.timeoutSeconds ?? 10,
+        port: monitor.port,
+        dnsRecordType: monitor.dnsRecordType ?? "A",
+        dnsExpectedValue: monitor.dnsExpectedValue,
+        sslExpiryWarningDays: monitor.sslExpiryWarningDays ?? 14,
+        requestHeadersJson: monitor.requestHeadersJson,
+        requestBody: monitor.requestBody,
+        status: "UNKNOWN",
+        enabled: true,
+        checkInterval: Number(monitor.checkInterval ?? 5),
+      });
+
+      if (errors?.length) {
+        throw new Error(errors[0].message);
+      }
+
+      setMessage("Monitor duplicated successfully.");
+      await loadMonitors();
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Could not duplicate monitor.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /* ----------------------------------------------------------
+     COPY URL
+     ---------------------------------------------------------- */
+
+  async function copyMonitorUrl(monitor: Monitor) {
+    try {
+      await navigator.clipboard.writeText(monitor.url);
+      setMessage("Monitor URL copied to clipboard.");
+    } catch {
+      setMessage("Could not copy the monitor URL.");
+    }
+  }
+
+  /* ----------------------------------------------------------
+     EXPORT MONITORS
+     ---------------------------------------------------------- */
+
+  function exportMonitors() {
+    if (monitors.length === 0) {
+      setMessage("There are no monitors to export.");
+      return;
+    }
+
+    const header = [
+      "Name",
+      "URL",
+      "Status",
+      "Enabled",
+      "Response Time (ms)",
+      "Last Checked",
+      "Check Interval (minutes)",
+      "Created At",
+      "Updated At",
+    ];
+
+    const rows = monitors.map((monitor) => [
+      monitor.name,
+      monitor.url,
+      monitor.status,
+      monitor.enabled ? "Yes" : "No",
+      monitor.responseTime ?? "",
+      monitor.lastChecked ?? "",
+      monitor.checkInterval ?? "",
+      monitor.createdAt ?? "",
+      monitor.updatedAt ?? "",
+    ]);
+
+    const csv = [header, ...rows]
+      .map((row) =>
+        row
+          .map((value) => {
+            const text = String(value ?? "");
+            return `"${text.replace(/"/g, '""')}"`;
+          })
+          .join(","),
+      )
+      .join("\n");
+
+    const blob = new Blob([csv], {
+      type: "text/csv;charset=utf-8;",
+    });
+
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = objectUrl;
+    link.download = `pulsecheck-monitors-${new Date()
+      .toISOString()
+      .slice(0, 10)}.csv`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+
+    setMessage("Monitor report exported.");
   }
 
   /* ----------------------------------------------------------
@@ -975,10 +1405,28 @@ function PremiumSelect({
 
         return true;
       })
-      .sort(
-        (a, b) => statusRank(a) - statusRank(b)
-      );
-  }, [monitors, search, filter]);
+      .sort((a, b) => {
+        if (sortMode === "name") {
+          return a.name.localeCompare(b.name);
+        }
+
+        if (sortMode === "response") {
+          return (
+            (a.responseTime ?? Number.MAX_SAFE_INTEGER) -
+            (b.responseTime ?? Number.MAX_SAFE_INTEGER)
+          );
+        }
+
+        if (sortMode === "recent") {
+          return (
+            new Date(b.lastChecked ?? b.updatedAt ?? b.createdAt ?? 0).getTime() -
+            new Date(a.lastChecked ?? a.updatedAt ?? a.createdAt ?? 0).getTime()
+          );
+        }
+
+        return statusRank(a) - statusRank(b);
+      });
+  }, [monitors, search, filter, sortMode]);
 
   /* ----------------------------------------------------------
      OVERALL STATE
@@ -1003,6 +1451,29 @@ function PremiumSelect({
   /* ----------------------------------------------------------
      OPTIONS
      ---------------------------------------------------------- */
+
+  const monitorTypeOptions: SelectOption[] = [
+    { value: "HTTP", label: "HTTP / HTTPS", description: "Website availability" },
+    { value: "API", label: "API", description: "Endpoint and response validation" },
+    { value: "TCP", label: "TCP / Port", description: "Network service reachability" },
+    { value: "DNS", label: "DNS", description: "DNS resolution monitoring" },
+    { value: "SSL", label: "SSL / TLS", description: "Certificate and expiry monitoring" },
+  ];
+
+  const methodOptions: SelectOption[] = [
+    { value: "GET", label: "GET", description: "Read endpoint" },
+    { value: "HEAD", label: "HEAD", description: "Headers only" },
+    { value: "POST", label: "POST", description: "API request" },
+    { value: "PUT", label: "PUT", description: "API update request" },
+  ];
+
+  const dnsRecordOptions: SelectOption[] = [
+    { value: "A", label: "A", description: "IPv4 address" },
+    { value: "AAAA", label: "AAAA", description: "IPv6 address" },
+    { value: "CNAME", label: "CNAME", description: "Canonical name" },
+    { value: "MX", label: "MX", description: "Mail exchange" },
+    { value: "TXT", label: "TXT", description: "Text record" },
+  ];
 
   const intervalOptions: SelectOption[] = [
     {
@@ -1033,33 +1504,56 @@ function PremiumSelect({
   ];
 
   /* ============================================================
-  /* ============================================================
      AUTH GUARD
      ============================================================ */
 
   if (!authReady) {
     return (
-      <main
-        className={`${inter.className} min-h-screen bg-[var(--pc-bg)] text-[var(--pc-text)]`}
-      >
+      <main className={`${inter.className} min-h-screen bg-[var(--pc-bg)] text-[var(--pc-text)]`}>
         <div className="flex min-h-screen items-center justify-center">
           <div className="flex flex-col items-center gap-5">
             <div className="relative flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] shadow-[var(--pc-shadow)]">
               <span className="absolute h-3 w-3 rounded-full bg-[#4C8DFF] shadow-[0_0_20px_rgba(76,141,255,0.65)]" />
               <span className="absolute h-7 w-7 animate-spin rounded-full border border-transparent border-t-[#4C8DFF]" />
             </div>
-            <p className="text-sm font-medium text-[var(--pc-muted)]">
-              Loading PulseCheck…
-            </p>
+            <p className="text-sm font-medium text-[var(--pc-muted)]">Loading PulseCheck…</p>
           </div>
         </div>
       </main>
     );
   }
 
-  if (!user) {
-    return null;
-  }
+  if (!user) return null;
+
+  const overallTone =
+    overall === "operational"
+      ? "healthy"
+      : overall === "down"
+        ? "critical"
+        : "idle";
+
+  const healthPercent =
+    activeTotal > 0
+      ? Math.round((healthy / activeTotal) * 100)
+      : 100;
+
+  const responseLabel =
+    averageResponse == null
+      ? "No samples yet"
+      : averageResponse < 200
+        ? "Excellent latency"
+        : averageResponse < 500
+          ? "Healthy latency"
+          : averageResponse < 1000
+            ? "Elevated latency"
+            : "High latency";
+
+  const statusItems = [
+    { key: "up" as const, label: "Healthy", value: healthy, tone: "success" },
+    { key: "down" as const, label: "Down", value: down, tone: "danger" },
+    { key: "unknown" as const, label: "Unknown", value: unknown, tone: "warning" },
+    { key: "disabled" as const, label: "Disabled", value: disabled, tone: "neutral" },
+  ];
 
   return (
     <main
@@ -1069,27 +1563,22 @@ function PremiumSelect({
           HEADER
           ======================================================== */}
 
-      <header className="sticky top-0 z-[80] border-b border-[var(--pc-border)] bg-[var(--pc-bg)]/92 backdrop-blur-xl">
-        <div className="mx-auto flex min-h-[72px] w-full max-w-[1500px] items-center justify-between gap-5 px-5 sm:px-7 xl:px-10">
-          <div className="flex min-w-0 items-center gap-3.5">
+      <header className="sticky top-0 z-[80] border-b border-[var(--pc-border)] bg-[var(--pc-bg)]/94 backdrop-blur-xl">
+        <div className="flex min-h-[74px] w-full items-center justify-between gap-4 px-4 sm:px-6 lg:px-8 xl:px-10">
+          <div className="flex min-w-0 items-center gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#4C8DFF]/25 bg-[#4C8DFF]/10 text-[#4C8DFF] shadow-[0_5px_20px_rgba(76,141,255,0.08)]">
               <Icon name="activity" size={20} strokeWidth={2} />
             </div>
 
             <div className="min-w-0">
               <div className="flex items-center gap-2.5">
-                <p className="truncate text-[16px] font-bold tracking-[-0.02em]">
-                  PulseCheck
-                </p>
-
+                <p className="truncate text-[16px] font-bold tracking-[-0.02em]">PulseCheck</p>
                 <span className="hidden rounded-md border border-[#34D399]/20 bg-[#34D399]/8 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] text-[#34D399] sm:inline">
                   Live
                 </span>
               </div>
 
-              <div
-                className={`${mono.className} mt-0.5 flex items-center gap-2 text-[10px] text-[var(--pc-muted)]`}
-              >
+              <div className={`${mono.className} mt-0.5 flex items-center gap-2 text-[10px] text-[var(--pc-muted)]`}>
                 <span>
                   {clock
                     ? clock.toLocaleTimeString([], {
@@ -1099,76 +1588,50 @@ function PremiumSelect({
                       })
                     : "--:--:--"}
                 </span>
-
                 <span className="opacity-40">•</span>
-
                 <span>Asia/Kolkata</span>
               </div>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
-            <button
+            {!fullscreen && <button
               type="button"
               onClick={() => void loadMonitors()}
               disabled={loadingMonitors}
               className="hidden h-10 items-center gap-2 rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] px-3.5 text-sm font-medium text-[var(--pc-muted)] transition-all hover:border-[var(--pc-border-hover)] hover:text-[var(--pc-text)] disabled:opacity-50 sm:flex"
             >
               <Icon name="refresh" size={16} />
-              <span>
-                {loadingMonitors
-                  ? "Refreshing"
-                  : "Refresh"}
-              </span>
-            </button>
+              <span>{loadingMonitors ? "Refreshing" : "Refresh"}</span>
+            </button>}
 
             <button
               type="button"
-              onClick={toggleFullscreen}
+              onClick={() => void toggleFullscreen()}
               className="hidden h-10 w-10 items-center justify-center rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] text-[var(--pc-muted)] transition-all hover:border-[var(--pc-border-hover)] hover:text-[var(--pc-text)] md:flex"
-              title="Fullscreen"
+              title={fullscreen ? "Exit NOC View" : "NOC View"}
             >
               <Icon name="expand" size={17} />
             </button>
 
-            <button
+            {!fullscreen && <button
               type="button"
-              onClick={() =>
-                changeTheme(
-                  theme === "dark" ? "light" : "dark"
-                )
-              }
+              onClick={() => changeTheme(theme === "dark" ? "light" : "dark")}
               className="flex h-10 w-10 items-center justify-center rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] text-[var(--pc-muted)] transition-all hover:border-[var(--pc-border-hover)] hover:text-[var(--pc-text)]"
               title="Change theme"
             >
-              {theme === "dark" ? (
-                <Icon name="sun" size={17} />
-              ) : (
-                <Icon name="moon" size={17} />
-              )}
-            </button>
+              {theme === "dark" ? <Icon name="sun" size={17} /> : <Icon name="moon" size={17} />}
+            </button>}
 
-            <div className="relative">
+            {!fullscreen && <div className="relative">
               <button
                 type="button"
-                onClick={() =>
-                  setShowProfileMenu(
-                    (current) => !current
-                  )
-                }
+                onClick={() => setShowProfileMenu((current) => !current)}
                 className="flex h-10 items-center gap-2 rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] px-2.5 text-sm font-medium transition-all hover:border-[var(--pc-border-hover)]"
               >
-                <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#4C8DFF]/12 text-[11px] font-bold text-[#4C8DFF]">
-                  U
-                </span>
-
-                <span className="hidden max-w-[110px] truncate text-[var(--pc-text)] lg:block">
-                  Account
-                </span>
-
-                <span className="hidden text-[var(--pc-muted)] sm:block">
-                  <Icon name="chevron" size={14} />
-                </span>
+                <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#4C8DFF]/12 text-[11px] font-bold text-[#4C8DFF]">U</span>
+                <span className="hidden max-w-[150px] truncate text-[var(--pc-text)] lg:block">Account</span>
+                <span className="hidden text-[var(--pc-muted)] sm:block"><Icon name="chevron" size={14} /></span>
               </button>
 
               {showProfileMenu && (
@@ -1184,9 +1647,7 @@ function PremiumSelect({
                     <Icon name="settings" size={16} />
                     Settings
                   </button>
-
                   <div className="my-1 border-t border-[var(--pc-border)]" />
-
                   <button
                     type="button"
                     onClick={() => void logout()}
@@ -1197,545 +1658,371 @@ function PremiumSelect({
                   </button>
                 </div>
               )}
-            </div>
+            </div>}
           </div>
         </div>
       </header>
 
-      {/* ========================================================
-          CONTENT
-          ======================================================== */}
+      <div className="w-full px-4 pb-16 pt-6 sm:px-6 lg:px-8 xl:px-10 2xl:px-14">
 
-      <div className="mx-auto w-full max-w-[1500px] px-5 pb-16 pt-7 sm:px-7 xl:px-10">
-        {!platformRunning && (
-          <section className="mb-4 flex flex-col gap-3 rounded-2xl border border-[#FB5B5B]/25 bg-[#FB5B5B]/[0.045] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-start gap-3">
-              <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-[#FB5B5B] shadow-[0_0_14px_rgba(251,91,91,0.55)]" />
-              <div>
-                <p className="text-sm font-bold text-[#FF8585]">PulseCheck is temporarily stopped</p>
-                <p className="mt-1 text-xs leading-5 text-[var(--pc-muted)]">
-                  {platformMessage || "Monitoring and new monitoring operations are currently unavailable. Please try again later or contact support."}
-                </p>
-              </div>
-            </div>
-            <span className="shrink-0 rounded-lg border border-[#FB5B5B]/20 bg-[#FB5B5B]/8 px-3 py-2 text-[11px] font-semibold text-[#FF9B9B]">
-              View-only mode
-            </span>
-          </section>
-        )}
-
-        {/* HERO */}
-
-        <section
-          className={`
-            relative overflow-hidden rounded-2xl border p-5
-            sm:p-6 xl:p-7
-            ${
-              overall === "down"
-                ? "border-[#FB5B5B]/25 bg-[#FB5B5B]/[0.035]"
-                : "border-[var(--pc-border)] bg-[var(--pc-surface)]"
-            }
-          `}
-        >
-          <div className="pointer-events-none absolute right-[-80px] top-[-100px] h-64 w-64 rounded-full bg-[#4C8DFF]/5 blur-[90px]" />
-
-          <div className="relative flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-              <div className="flex items-center gap-3">
-                <span className="relative flex h-3.5 w-3.5">
-                  <span
-                    className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-35 ${
-                      overall === "down"
-                        ? "bg-[#FB5B5B]"
-                        : overall === "idle"
-                          ? "bg-[#7C8699]"
-                          : "bg-[#34D399]"
-                    }`}
-                  />
-
-                  <span
-                    className={`relative inline-flex h-3.5 w-3.5 rounded-full ${
-                      overall === "down"
-                        ? "bg-[#FB5B5B]"
-                        : overall === "idle"
-                          ? "bg-[#7C8699]"
-                          : "bg-[#34D399]"
-                    }`}
-                  />
+        {/* COMMAND BAR */}
+        {!fullscreen && <section className="mb-5 rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5 shadow-[var(--pc-shadow)] xl:p-6">
+          <div className="flex flex-col gap-5 2xl:flex-row 2xl:items-end 2xl:justify-between">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] ${
+                  overallTone === "healthy"
+                    ? "border-[#34D399]/20 bg-[#34D399]/8 text-[#34D399]"
+                    : overallTone === "critical"
+                      ? "border-[#FB5B5B]/20 bg-[#FB5B5B]/8 text-[#FB8585]"
+                      : "border-[var(--pc-border)] bg-[var(--pc-input)] text-[var(--pc-muted)]"
+                }`}>
+                  Monitoring active
                 </span>
-
-                <h1
-                  className={`text-xl font-bold tracking-[-0.025em] sm:text-2xl ${
-                    overall === "down"
-                      ? "text-[#FB5B5B]"
-                      : overall === "idle"
-                        ? "text-[var(--pc-muted)]"
-                        : "text-[#34D399]"
-                  }`}
-                >
-                  {overallTitle}
-                </h1>
+                <span className="text-[11px] text-[var(--pc-muted)]">Personal monitoring workspace</span>
               </div>
 
-              <p className="mt-2 pl-6 text-sm text-[var(--pc-muted)]">
+              <h1 className="mt-3 text-2xl font-bold tracking-[-0.03em] sm:text-3xl">
+                {overallTitle}
+              </h1>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-[var(--pc-muted)]">
                 {down > 0
-                  ? "Review the affected services below."
-                  : "Real-time visibility across your monitored services."}
+                  ? `${down} monitored service${down === 1 ? " requires" : "s require"} attention. Review the affected service cards and recent checks below.`
+                  : activeTotal > 0
+                    ? "Your services are being checked continuously. Use the controls below to operate monitors without leaving the command center."
+                    : "Create your first monitor to start collecting availability and response-time data."}
               </p>
             </div>
 
             <button
               type="button"
               onClick={() => {
-                if (!platformRunning) {
-                  setMessage(
-                    platformMessage ||
-                      "PulseCheck is temporarily stopped. Contact support before creating a monitor.",
-                  );
-                  return;
-                }
                 setMessage("");
                 setShowAdd(true);
               }}
-              disabled={!platformLoaded || !platformRunning}
+              disabled={false}
               className="flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 text-sm font-bold text-white shadow-[0_8px_25px_rgba(76,141,255,0.18)] transition-all hover:-translate-y-0.5 hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-45"
             >
               <Icon name="plus" size={17} strokeWidth={2.2} />
               Add monitor
             </button>
           </div>
-        </section>
+        </section>}
 
-        {/* MESSAGE */}
-
-        {message && (
-          <div className="mt-4 flex items-center justify-between gap-4 rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] px-4 py-3 text-sm text-[var(--pc-muted)] shadow-sm">
+        {!fullscreen && message && (
+          <div className="mb-5 flex items-center justify-between gap-4 rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] px-4 py-3 text-sm text-[var(--pc-muted)] shadow-sm">
             <span>{message}</span>
-
-            <button
-              type="button"
-              onClick={() => setMessage("")}
-              className="shrink-0 text-[var(--pc-muted)] hover:text-[var(--pc-text)]"
-            >
+            <button type="button" onClick={() => setMessage("")} className="shrink-0 text-[var(--pc-muted)] hover:text-[var(--pc-text)]">
               <Icon name="x" size={15} />
             </button>
           </div>
         )}
 
-        {/* STATISTICS */}
-
-        <section className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+        {/* KPI GRID */}
+        <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
           {[
-            {
-              label: "Total",
-              value: total,
-              icon: "monitor" as const,
-              valueClass: "text-[var(--pc-text)]",
-            },
-            {
-              label: "Healthy",
-              value: healthy,
-              icon: "check" as const,
-              valueClass: "text-[#34D399]",
-            },
-            {
-              label: "Down",
-              value: down,
-              icon: "bell" as const,
-              valueClass: "text-[#FB5B5B]",
-            },
-            {
-              label: "Unknown",
-              value: unknown,
-              icon: "clock" as const,
-              valueClass: "text-[#E8B94A]",
-            },
-            {
-              label: "Availability",
-              value: `${availability}%`,
-              icon: "chart" as const,
-              valueClass: "text-[#4C8DFF]",
-            },
+            { label: "Total monitors", value: total, sub: "Registered", tone: "neutral", icon: "monitor" as const },
+            { label: "Healthy", value: healthy, sub: activeTotal ? `${healthPercent}% of active` : "No active checks", tone: "success", icon: "check" as const },
+            { label: "Down", value: down, sub: down ? "Needs attention" : "No failures", tone: "danger", icon: "bell" as const },
+            { label: "Unknown", value: unknown, sub: unknown ? "Waiting for checks" : "No unknowns", tone: "warning", icon: "clock" as const },
+            { label: "Disabled", value: disabled, sub: disabled ? "Paused by you" : "All enabled", tone: "neutral", icon: "pause" as const },
+            { label: "Availability", value: `${availability}%`, sub: responseLabel, tone: "accent", icon: "chart" as const },
           ].map((item) => (
-            <div
-              key={item.label}
-              className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-4 transition-all hover:-translate-y-0.5 hover:shadow-[var(--pc-shadow)] sm:p-5"
-            >
-              <div className="flex items-center justify-between">
-                <span className="text-[12px] font-medium text-[var(--pc-muted)]">
-                  {item.label}
-                </span>
-
-                <span className="text-[var(--pc-muted)]">
-                  <Icon name={item.icon} size={16} />
+            <article key={item.label} className="min-w-0 rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-4 shadow-[var(--pc-shadow)]">
+              <div className="flex items-center justify-between gap-3">
+                <span className="truncate text-[11px] font-semibold uppercase tracking-[0.09em] text-[var(--pc-muted)]">{item.label}</span>
+                <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
+                  item.tone === "success" ? "bg-[#34D399]/10 text-[#34D399]" :
+                  item.tone === "danger" ? "bg-[#FB5B5B]/10 text-[#FB5B5B]" :
+                  item.tone === "warning" ? "bg-[#E8B94A]/10 text-[#E8B94A]" :
+                  item.tone === "accent" ? "bg-[#4C8DFF]/10 text-[#4C8DFF]" :
+                  "bg-[var(--pc-icon-bg)] text-[var(--pc-muted)]"
+                }`}>
+                  <Icon name={item.icon} size={15} />
                 </span>
               </div>
-
-              <p
-                className={`${mono.className} mt-2 text-2xl font-semibold tracking-[-0.04em] ${item.valueClass}`}
-              >
-                {item.value}
-              </p>
-            </div>
+              <strong className={`${mono.className} mt-4 block text-2xl font-semibold tracking-[-0.04em] ${
+                item.tone === "success" ? "text-[#34D399]" :
+                item.tone === "danger" ? "text-[#FB5B5B]" :
+                item.tone === "warning" ? "text-[#E8B94A]" :
+                item.tone === "accent" ? "text-[#4C8DFF]" :
+                "text-[var(--pc-text)]"
+              }`}>{item.value}</strong>
+              <p className="mt-1 truncate text-[11px] text-[var(--pc-muted)]">{item.sub}</p>
+            </article>
           ))}
         </section>
 
-        {/* TOOLBAR */}
-
-        <section className="mt-7">
-          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-            <div>
-              <h2 className="text-lg font-bold tracking-[-0.02em]">
-                Monitors
-              </h2>
-
-              <p className="mt-1 text-sm text-[var(--pc-muted)]">
-                Service health, response time and availability.
-              </p>
+        {/* OPERATIONS OVERVIEW */}
+        {!fullscreen && <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(320px,0.8fr)]">
+          <article className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5 shadow-[var(--pc-shadow)] xl:p-6">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-[0.13em] text-[var(--pc-muted)]">Service health overview</p>
+                <h2 className="mt-1.5 text-lg font-bold tracking-[-0.02em]">Reliability pulse</h2>
+              </div>
+              <div className="text-left sm:text-right">
+                <p className={`${mono.className} text-2xl font-semibold text-[#4C8DFF]`}>{availability}%</p>
+                <p className="text-[11px] text-[var(--pc-muted)]">Current active availability</p>
+              </div>
             </div>
 
-            <div className="flex flex-col gap-2 sm:flex-row">
-              <div className="relative min-w-0 sm:w-64">
-                <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--pc-muted)]">
-                  <Icon name="search" size={16} />
-                </span>
-
-                <input
-                  value={search}
-                  onChange={(event) =>
-                    setSearch(event.target.value)
-                  }
-                  className="h-10 w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] pl-10 pr-3 text-sm outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/8"
-                  placeholder="Search monitors"
+            <div className="mt-6 grid gap-6 lg:grid-cols-[220px_minmax(0,1fr)]">
+              <div className="relative mx-auto flex h-48 w-48 items-center justify-center">
+                <div
+                  className="absolute inset-0 rounded-full"
+                  style={{ background: `conic-gradient(#34D399 ${healthPercent}%, #202938 ${healthPercent}% 100%)` }}
                 />
+                <div className="absolute inset-[11px] rounded-full bg-[var(--pc-surface)]" />
+                <div className="relative text-center">
+                  <strong className={`${mono.className} block text-4xl font-semibold tracking-[-0.06em]`}>{healthPercent}%</strong>
+                  <span className="mt-1 block text-[11px] text-[var(--pc-muted)]">healthy services</span>
+                </div>
               </div>
 
-              <div className="flex overflow-x-auto rounded-xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-1">
-                {[
-                  ["all", "All"],
-                  ["up", "Healthy"],
-                  ["down", "Down"],
-                  ["unknown", "Unknown"],
-                  ["disabled", "Disabled"],
-                ].map(([value, label]) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() =>
-                      setFilter(
-                        value as DashboardFilter
-                      )
-                    }
-                    className={`whitespace-nowrap rounded-lg px-3 py-2 text-xs font-semibold transition-all ${
-                      filter === value
-                        ? "bg-[var(--pc-input)] text-[var(--pc-text)] shadow-sm"
-                        : "text-[var(--pc-muted)] hover:text-[var(--pc-text)]"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
+              <div className="space-y-4">
+                {statusItems.map((item) => {
+                  const percentage = total > 0 ? Math.round((item.value / total) * 100) : 0;
+                  return (
+                    <div key={item.key}>
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <span className={`h-2.5 w-2.5 rounded-full ${
+                            item.tone === "success" ? "bg-[#34D399]" :
+                            item.tone === "danger" ? "bg-[#FB5B5B]" :
+                            item.tone === "warning" ? "bg-[#E8B94A]" :
+                            "bg-[var(--pc-muted)]"
+                          }`} />
+                          <span className="text-xs font-semibold">{item.label}</span>
+                        </div>
+                        <span className={`${mono.className} text-xs text-[var(--pc-muted)]`}>{item.value} · {percentage}%</span>
+                      </div>
+                      <div className="h-2 overflow-hidden rounded-full bg-[var(--pc-input)]">
+                        <div
+                          className={`h-full rounded-full ${
+                            item.tone === "success" ? "bg-[#34D399]" :
+                            item.tone === "danger" ? "bg-[#FB5B5B]" :
+                            item.tone === "warning" ? "bg-[#E8B94A]" :
+                            "bg-[var(--pc-muted)]"
+                          }`}
+                          style={{ width: `${percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <div className="mt-3 grid grid-cols-2 gap-3 border-t border-[var(--pc-border)] pt-4 sm:grid-cols-3">
+                  <div className="rounded-xl bg-[var(--pc-input)] p-3">
+                    <span className="block text-[10px] uppercase tracking-[0.08em] text-[var(--pc-muted)]">Average response</span>
+                    <strong className={`${mono.className} mt-1 block text-sm`}>{averageResponse == null ? "—" : `${averageResponse} ms`}</strong>
+                  </div>
+                  <div className="rounded-xl bg-[var(--pc-input)] p-3">
+                    <span className="block text-[10px] uppercase tracking-[0.08em] text-[var(--pc-muted)]">Check cycle</span>
+                    <strong className={`${mono.className} mt-1 block text-sm`}>15 sec refresh</strong>
+                  </div>
+                  <div className="rounded-xl bg-[var(--pc-input)] p-3 sm:col-span-1 col-span-2">
+                    <span className="block text-[10px] uppercase tracking-[0.08em] text-[var(--pc-muted)]">Platform</span>
+                    <strong className="mt-1 block text-sm">Operational</strong>
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
-        </section>
+          </article>
 
-        {/* MONITOR TABLE */}
+          <article className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5 shadow-[var(--pc-shadow)] xl:p-6">
+            <p className="text-[10px] font-bold uppercase tracking-[0.13em] text-[var(--pc-muted)]">Operations</p>
+            <h2 className="mt-1.5 text-lg font-bold tracking-[-0.02em]">Quick control</h2>
 
-        <section className="mt-4 overflow-hidden rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)]">
-          <div className="hidden grid-cols-[minmax(250px,1.8fr)_120px_130px_140px_120px] gap-4 border-b border-[var(--pc-border)] bg-[var(--pc-surface-soft)] px-5 py-3.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[var(--pc-muted)] lg:grid">
-            <span>Service</span>
-            <span>Status</span>
-            <span>Response</span>
-            <span>Last checked</span>
-            <span className="text-right">Actions</span>
-          </div>
+            <div className="mt-5 space-y-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setMessage("");
+                  setShowAdd(true);
+                }}
+                disabled={false}
+                className="flex w-full items-center justify-between rounded-xl border border-[#4C8DFF]/20 bg-[#4C8DFF]/8 px-4 py-3 text-left transition-all hover:border-[#4C8DFF]/40 hover:bg-[#4C8DFF]/12 disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                <span className="flex items-center gap-3">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#4C8DFF]/10 text-[#4C8DFF]"><Icon name="plus" size={16} /></span>
+                  <span><strong className="block text-sm">Create monitor</strong><span className="block text-[11px] text-[var(--pc-muted)]">Add a website or API endpoint</span></span>
+                </span>
+                <Icon name="arrow" size={15} />
+              </button>
 
-          {filteredMonitors.length === 0 ? (
-            <div className="flex min-h-[300px] flex-col items-center justify-center px-6 text-center">
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-input)] text-[var(--pc-muted)]">
-                <Icon name="monitor" size={24} />
-              </div>
+              <button
+                type="button"
+                onClick={() => void loadMonitors()}
+                disabled={loadingMonitors}
+                className="flex w-full items-center justify-between rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3 text-left transition-all hover:border-[var(--pc-border-hover)]"
+              >
+                <span className="flex items-center gap-3">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-[var(--pc-icon-bg)] text-[var(--pc-muted)]"><Icon name="refresh" size={16} /></span>
+                  <span><strong className="block text-sm">Refresh now</strong><span className="block text-[11px] text-[var(--pc-muted)]">Pull the latest monitor state</span></span>
+                </span>
+                <span className={`${mono.className} text-[11px] text-[var(--pc-muted)]`}>{loadingMonitors ? "Working" : "Ready"}</span>
+              </button>
 
-              <h3 className="mt-4 text-base font-bold">
-                {monitors.length === 0
-                  ? "No monitors yet"
-                  : "No matching monitors"}
-              </h3>
+              <button
+                type="button"
+                onClick={exportMonitors}
+                className="flex w-full items-center justify-between rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3 text-left transition-all hover:border-[var(--pc-border-hover)]"
+              >
+                <span className="flex items-center gap-3">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-[var(--pc-icon-bg)] text-[var(--pc-muted)]"><Icon name="chart" size={16} /></span>
+                  <span><strong className="block text-sm">Export report</strong><span className="block text-[11px] text-[var(--pc-muted)]">Download monitor data as CSV</span></span>
+                </span>
+                <Icon name="arrow" size={15} />
+              </button>
+            </div>
 
-              <p className="mt-1.5 max-w-md text-sm leading-6 text-[var(--pc-muted)]">
-                {monitors.length === 0
-                  ? "Add your first website or API endpoint and PulseCheck will start tracking it."
-                  : "Try changing the search or status filter."}
-              </p>
-
-              {monitors.length === 0 && (
+            <div className="mt-5 border-t border-[var(--pc-border)] pt-4">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs text-[var(--pc-muted)]">Auto refresh</span>
                 <button
                   type="button"
-                  onClick={() => setShowAdd(true)}
-                  className="mt-5 flex items-center gap-2 rounded-xl bg-[#4C8DFF] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#3E7CE8]"
+                  onClick={() => setAutoRefresh((current) => !current)}
+                  className={`rounded-full px-3 py-1.5 text-[11px] font-bold transition-colors ${autoRefresh ? "bg-[#34D399]/10 text-[#34D399]" : "bg-[var(--pc-input)] text-[var(--pc-muted)]"}`}
                 >
-                  <Icon name="plus" size={16} />
-                  Add your first monitor
+                  {autoRefresh ? "ON · 15s" : "OFF"}
                 </button>
-              )}
+              </div>
+              <div className="mt-3 flex items-center justify-between gap-3 text-[11px]">
+                <span className="text-[var(--pc-muted)]">Last dashboard refresh</span>
+                <span className={`${mono.className} text-[var(--pc-text)]`}>{clock ? clock.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</span>
+              </div>
             </div>
-          ) : (
-            <div className="divide-y divide-[var(--pc-border)]">
-              {filteredMonitors.map((monitor) => {
-                const status = getStatus(monitor);
+          </article>
+        </section>} 
 
-                const statusColor =
-                  status === "up"
-                    ? "#34D399"
-                    : status === "down"
-                      ? "#FB5B5B"
-                      : status === "unknown"
-                        ? "#E8B94A"
-                        : "#7C8699";
+        {/* MONITORS */}
+        <section className="mt-6">
+          {!fullscreen && <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.13em] text-[var(--pc-muted)]">Service inventory</p>
+              <h2 className="mt-1.5 text-xl font-bold tracking-[-0.025em]">Monitors</h2>
+              <p className="mt-1 text-sm text-[var(--pc-muted)]">Manage health, response time, availability and monitor lifecycle from one workspace.</p>
+            </div>
 
-                const statusBg =
-                  status === "up"
-                    ? "bg-[#34D399]/8"
-                    : status === "down"
-                      ? "bg-[#FB5B5B]/8"
-                      : status === "unknown"
-                        ? "bg-[#E8B94A]/8"
-                        : "bg-[var(--pc-input)]";
 
-                return (
-                  <div
-                    key={monitor.id}
-                    className="group px-4 py-4 transition-colors hover:bg-[var(--pc-hover)]/45 sm:px-5 sm:py-5"
+          </div>} 
+
+          <section className="mt-4 overflow-hidden rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] shadow-[var(--pc-shadow)]">
+            <div className="hidden grid-cols-[minmax(250px,1.8fr)_120px_130px_140px_minmax(260px,1fr)] gap-4 border-b border-[var(--pc-border)] bg-[var(--pc-surface-soft)] px-5 py-3.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[var(--pc-muted)] lg:grid">
+              <span>Service</span>
+              <span>Status</span>
+              <span>Response</span>
+              <span>Last checked</span>
+              <span className="text-right">Actions</span>
+            </div>
+
+            {filteredMonitors.length === 0 ? (
+              <div className="flex min-h-[310px] flex-col items-center justify-center px-6 text-center">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-input)] text-[var(--pc-muted)]"><Icon name="monitor" size={24} /></div>
+                <h3 className="mt-4 text-base font-bold">{monitors.length === 0 ? "No monitors yet" : "No matching monitors"}</h3>
+                <p className="mt-1.5 max-w-md text-sm leading-6 text-[var(--pc-muted)]">
+                  {monitors.length === 0 ? "Add your first website or API endpoint and PulseCheck will start tracking it." : "Try changing the search or status filter."}
+                </p>
+                {monitors.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAdd(true)}
+                    disabled={false}
+                    className="mt-5 flex items-center gap-2 rounded-xl bg-[#4C8DFF] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-45"
                   >
-                    <div className="grid gap-4 lg:grid-cols-[minmax(250px,1.8fr)_120px_130px_140px_120px] lg:items-center">
-                      {/* SERVICE */}
-
-                      <div className="min-w-0">
-                        <div className="flex items-start gap-3">
-                          <span
-                            className="mt-1.5 flex h-2.5 w-2.5 shrink-0 rounded-full"
-                            style={{
-                              backgroundColor: statusColor,
-                              boxShadow:
-                                status === "up"
-                                  ? "0 0 12px rgba(52,211,153,.45)"
-                                  : status === "down"
-                                    ? "0 0 12px rgba(251,91,91,.35)"
-                                    : "none",
-                            }}
-                          />
-
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <h3 className="truncate text-sm font-bold text-[var(--pc-text)]">
-                                {monitor.name}
-                              </h3>
-
-                              <span
-                                className={`${mono.className} rounded-md px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em]`}
-                                style={{
-                                  color: statusColor,
-                                  backgroundColor:
-                                    `${statusColor}12`,
-                                }}
-                              >
-                                {status}
-                              </span>
-                            </div>
-
-                            <div className="mt-1 flex min-w-0 items-center gap-1.5">
-                              <p
-                                className={`${mono.className} truncate text-[11px] text-[var(--pc-muted)]`}
-                              >
-                                {monitor.url}
-                              </p>
-
-                              <a
-                                href={monitor.url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="shrink-0 text-[var(--pc-muted)] opacity-0 transition-opacity hover:text-[#4C8DFF] group-hover:opacity-100"
-                                title="Open endpoint"
-                              >
-                                <Icon
-                                  name="external"
-                                  size={12}
-                                />
-                              </a>
+                    <Icon name="plus" size={16} />
+                    Add your first monitor
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="divide-y divide-[var(--pc-border)]">
+                {filteredMonitors.map((monitor) => {
+                  const status = getStatus(monitor);
+                  const statusColor = status === "up" ? "#34D399" : status === "down" ? "#FB5B5B" : status === "unknown" ? "#E8B94A" : "#7C8699";
+                  return (
+                    <article key={monitor.id} className="group px-4 py-4 transition-colors hover:bg-[var(--pc-hover)]/45 sm:px-5 sm:py-5">
+                      <div className="grid gap-4 lg:grid-cols-[minmax(250px,1.8fr)_120px_130px_140px_minmax(260px,1fr)] lg:items-center">
+                        <div className="min-w-0">
+                          <div className="flex items-start gap-3">
+                            <span className="mt-1.5 flex h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: statusColor, boxShadow: status === "up" ? "0 0 12px rgba(52,211,153,.45)" : status === "down" ? "0 0 12px rgba(251,91,91,.35)" : "none" }} />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                {fullscreen ? (
+                                  <span className="truncate text-left text-sm font-bold text-[var(--pc-text)]">{monitor.name}</span>
+                                ) : (
+                                  <button type="button" onClick={() => void openDetail(monitor)} className="truncate text-left text-sm font-bold text-[var(--pc-text)] transition-colors hover:text-[#4C8DFF]">{monitor.name}</button>
+                                )}
+                                <span className={`${mono.className} rounded-md px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em]`} style={{ color: statusColor, backgroundColor: `${statusColor}12` }}>{status}</span>
+                              </div>
+                              <div className="mt-1 flex min-w-0 items-center gap-2">
+                                <p className={`${mono.className} truncate text-[11px] text-[var(--pc-muted)]`}>{monitor.url}</p>
+                                <a href={monitor.url} target="_blank" rel="noreferrer" className="shrink-0 text-[var(--pc-muted)] transition-colors hover:text-[#4C8DFF]" title="Open endpoint"><Icon name="external" size={12} /></a>
+                              </div>
                             </div>
                           </div>
                         </div>
+
+                        <div className="flex items-center gap-2 lg:block">
+                          <span className="text-[11px] text-[var(--pc-muted)] lg:hidden">Status</span>
+                          <span className="inline-flex items-center rounded-lg px-2.5 py-1.5 text-xs font-semibold" style={{ color: statusColor, backgroundColor: `${statusColor}12` }}>{status === "up" ? "Operational" : status === "down" ? "Down" : status === "disabled" ? "Disabled" : "Waiting"}</span>
+                        </div>
+
+                        <div className="flex items-center gap-2 lg:block">
+                          <span className="text-[11px] text-[var(--pc-muted)] lg:hidden">Response</span>
+                          <span className={`${mono.className} text-xs font-medium text-[var(--pc-text)]`}>{formatResponse(monitor.responseTime)}</span>
+                        </div>
+
+                        <div className="flex items-center gap-2 lg:block">
+                          <span className="text-[11px] text-[var(--pc-muted)] lg:hidden">Checked</span>
+                          <span className={`${mono.className} text-xs text-[var(--pc-muted)]`}>{formatChecked(monitor.lastChecked)}</span>
+                        </div>
+
+                        {!fullscreen && <div className="flex flex-wrap items-center justify-start gap-2 lg:justify-end">
+                          <button type="button" onClick={() => void openDetail(monitor)} className="inline-flex h-9 min-w-[72px] items-center justify-center gap-1.5 rounded-lg border border-[var(--pc-border)] bg-[var(--pc-input)] px-3 text-[11px] font-semibold text-[var(--pc-text)] transition-all hover:border-[#4C8DFF]/40 hover:bg-[#4C8DFF]/8 hover:text-[#4C8DFF]"><Icon name="eye" size={13} />View</button>
+                          <button type="button" onClick={() => beginEditMonitor(monitor)} className="inline-flex h-9 min-w-[72px] items-center justify-center gap-1.5 rounded-lg border border-[var(--pc-border)] bg-[var(--pc-input)] px-3 text-[11px] font-semibold text-[var(--pc-text)] transition-all hover:border-[#4C8DFF]/40 hover:bg-[#4C8DFF]/8 hover:text-[#4C8DFF]"><Icon name="settings" size={13} />Edit</button>
+                          <button type="button" onClick={() => void toggleMonitor(monitor)} disabled={false} className="inline-flex h-9 min-w-[92px] items-center justify-center gap-1.5 rounded-lg border border-[var(--pc-border)] bg-[var(--pc-input)] px-3 text-[11px] font-semibold text-[var(--pc-text)] transition-all hover:border-[#4C8DFF]/40 hover:bg-[#4C8DFF]/8 hover:text-[#4C8DFF] disabled:cursor-not-allowed disabled:opacity-45"><Icon name={monitor.enabled ? "pause" : "play"} size={13} />{monitor.enabled ? "Disable" : "Enable"}</button>
+                          <button type="button" onClick={() => void copyMonitorUrl(monitor)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[var(--pc-border)] bg-[var(--pc-input)] text-[var(--pc-muted)] transition-all hover:border-[#4C8DFF]/40 hover:bg-[#4C8DFF]/8 hover:text-[#4C8DFF]" title="Copy URL"><Icon name="external" size={13} /></button>
+                          <button type="button" onClick={() => void duplicateMonitor(monitor)} disabled={false} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[var(--pc-border)] bg-[var(--pc-input)] text-[var(--pc-muted)] transition-all hover:border-[#4C8DFF]/40 hover:bg-[#4C8DFF]/8 hover:text-[#4C8DFF] disabled:cursor-not-allowed disabled:opacity-45" title="Duplicate monitor"><Icon name="plus" size={13} /></button>
+                          <button type="button" onClick={() => void deleteMonitor(monitor.id)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-transparent text-[var(--pc-muted)] transition-all hover:border-[#FB5B5B]/20 hover:bg-[#FB5B5B]/8 hover:text-[#FB5B5B]" title="Delete monitor"><Icon name="trash" size={14} /></button>
+                        </div>} 
                       </div>
-
-                      {/* STATUS */}
-
-                      <div className="flex items-center gap-2 lg:block">
-                        <span className="text-[11px] text-[var(--pc-muted)] lg:hidden">
-                          Status
-                        </span>
-
-                        <span
-                          className={`inline-flex items-center rounded-lg px-2.5 py-1.5 text-xs font-semibold ${statusBg}`}
-                          style={{ color: statusColor }}
-                        >
-                          {status === "up"
-                            ? "Operational"
-                            : status === "down"
-                              ? "Down"
-                              : status === "disabled"
-                                ? "Disabled"
-                                : "Waiting"}
-                        </span>
-                      </div>
-
-                      {/* RESPONSE */}
-
-                      <div className="flex items-center gap-2 lg:block">
-                        <span className="text-[11px] text-[var(--pc-muted)] lg:hidden">
-                          Response
-                        </span>
-
-                        <span
-                          className={`${mono.className} text-xs font-medium text-[var(--pc-text)]`}
-                        >
-                          {formatResponse(
-                            monitor.responseTime
-                          )}
-                        </span>
-                      </div>
-
-                      {/* CHECKED */}
-
-                      <div className="flex items-center gap-2 lg:block">
-                        <span className="text-[11px] text-[var(--pc-muted)] lg:hidden">
-                          Checked
-                        </span>
-
-                        <span
-                          className={`${mono.className} text-xs text-[var(--pc-muted)]`}
-                        >
-                          {formatChecked(
-                            monitor.lastChecked
-                          )}
-                        </span>
-                      </div>
-
-                      {/* ACTIONS */}
-
-                      <div className="flex items-center justify-between gap-2 lg:justify-end">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void toggleMonitor(monitor)
-                          }
-                          disabled={!platformLoaded || !platformRunning}
-                          className="flex items-center gap-1.5 rounded-lg border border-[var(--pc-border)] px-2.5 py-1.5 text-[11px] font-semibold text-[var(--pc-muted)] transition-colors hover:border-[var(--pc-border-hover)] hover:text-[var(--pc-text)]"
-                        >
-                          <Icon
-                            name={
-                              monitor.enabled
-                                ? "pause"
-                                : "play"
-                            }
-                            size={13}
-                          />
-
-                          {monitor.enabled
-                            ? "Disable"
-                            : "Enable"}
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void deleteMonitor(
-                              monitor.id
-                            )
-                          }
-                          className="flex h-8 w-8 items-center justify-center rounded-lg text-[var(--pc-muted)] transition-colors hover:bg-[#FB5B5B]/8 hover:text-[#FB5B5B]"
-                          title="Delete monitor"
-                        >
-                          <Icon
-                            name="trash"
-                            size={14}
-                          />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </section>
 
-        {/* FOOTER INSIGHT */}
+        {/* INSIGHTS */}
+        <section className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <article className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5 shadow-[var(--pc-shadow)]">
+            <div className="flex items-center gap-3"><div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#4C8DFF]/10 text-[#4C8DFF]"><Icon name="zap" size={17} /></div><div><p className="text-xs font-bold">Average response</p><p className={`${mono.className} mt-1 text-sm text-[var(--pc-muted)]`}>{averageResponse != null ? `${averageResponse} ms` : "Waiting for data"}</p></div></div>
+            <p className="mt-4 text-[11px] leading-5 text-[var(--pc-muted)]">{responseLabel}. Response time is calculated from the currently available healthy monitor samples.</p>
+          </article>
 
-        <section className="mt-5 grid gap-4 md:grid-cols-3">
-          <div className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#4C8DFF]/10 text-[#4C8DFF]">
-                <Icon name="zap" size={17} />
-              </div>
+          <article className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5 shadow-[var(--pc-shadow)]">
+            <div className="flex items-center gap-3"><div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#34D399]/10 text-[#34D399]"><Icon name="shield" size={17} /></div><div><p className="text-xs font-bold">Monitoring coverage</p><p className={`${mono.className} mt-1 text-sm text-[var(--pc-muted)]`}>{activeTotal} active service{activeTotal === 1 ? "" : "s"}</p></div></div>
+            <p className="mt-4 text-[11px] leading-5 text-[var(--pc-muted)]">Every active monitor contributes to the live service-health picture shown above.</p>
+          </article>
 
-              <div>
-                <p className="text-xs font-bold">
-                  Average response
-                </p>
+          <article className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5 shadow-[var(--pc-shadow)]">
+            <div className="flex items-center gap-3"><div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#E8B94A]/10 text-[#E8B94A]"><Icon name="clock" size={17} /></div><div><p className="text-xs font-bold">Auto refresh</p><p className={`${mono.className} mt-1 text-sm text-[var(--pc-muted)]`}>{autoRefresh ? "Every 15 seconds" : "Paused"}</p></div></div>
+            <p className="mt-4 text-[11px] leading-5 text-[var(--pc-muted)]">Keep this enabled for a continuously updated command center.</p>
+          </article>
 
-                <p
-                  className={`${mono.className} mt-1 text-sm text-[var(--pc-muted)]`}
-                >
-                  {averageResponse != null
-                    ? `${averageResponse} ms`
-                    : "Waiting for data"}
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#34D399]/10 text-[#34D399]">
-                <Icon name="shield" size={17} />
-              </div>
-
-              <div>
-                <p className="text-xs font-bold">
-                  Monitoring coverage
-                </p>
-
-                <p
-                  className={`${mono.className} mt-1 text-sm text-[var(--pc-muted)]`}
-                >
-                  {activeTotal} active service
-                  {activeTotal === 1 ? "" : "s"}
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#E8B94A]/10 text-[#E8B94A]">
-                <Icon name="clock" size={17} />
-              </div>
-
-              <div>
-                <p className="text-xs font-bold">
-                  Auto refresh
-                </p>
-
-                <p
-                  className={`${mono.className} mt-1 text-sm text-[var(--pc-muted)]`}
-                >
-                  Every 15 seconds
-                </p>
-              </div>
-            </div>
-          </div>
+          <article className="rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] p-5 shadow-[var(--pc-shadow)]">
+            <div className="flex items-center gap-3"><div className={`flex h-9 w-9 items-center justify-center rounded-xl ${down ? "bg-[#FB5B5B]/10 text-[#FB5B5B]" : "bg-[#34D399]/10 text-[#34D399]"}`}><Icon name={down ? "bell" : "check"} size={17} /></div><div><p className="text-xs font-bold">Operational queue</p><p className={`${mono.className} mt-1 text-sm ${down ? "text-[#FB5B5B]" : "text-[#34D399]"}`}>{down ? `${down} issue${down === 1 ? "" : "s"}` : "All clear"}</p></div></div>
+            <p className="mt-4 text-[11px] leading-5 text-[var(--pc-muted)]">{down ? "Open affected services to inspect response and incident history." : "No service currently requires attention."}</p>
+          </article>
         </section>
+
+        <footer className="mt-8 flex flex-col gap-2 border-t border-[var(--pc-border)] py-5 text-[10px] text-[var(--pc-muted)] sm:flex-row sm:items-center sm:justify-between">
+          <span>PulseCheck · personal uptime intelligence workspace</span>
+          <span className={mono.className}>Live refresh · 15 seconds</span>
+        </footer>
       </div>
 
       {/* ========================================================
@@ -1795,9 +2082,17 @@ function PremiumSelect({
                 </div>
               </div>
 
+              <PremiumSelect
+                label="Monitor type"
+                value={monitorType}
+                onChange={setMonitorType}
+                options={monitorTypeOptions}
+                icon={<Icon name="activity" size={16} />}
+              />
+
               <div>
                 <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
-                  URL
+                  Target
                 </label>
 
                 <div className="relative">
@@ -1815,6 +2110,135 @@ function PremiumSelect({
                     type="url"
                   />
                 </div>
+              </div>
+
+              {(monitorType === "HTTP" || monitorType === "API") && (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <PremiumSelect
+                    label="HTTP method"
+                    value={method}
+                    onChange={setMethod}
+                    options={methodOptions}
+                    icon={<Icon name="arrow" size={16} />}
+                  />
+
+                  <div>
+                    <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                      Expected status
+                    </label>
+                    <input
+                      value={expectedStatusCode}
+                      onChange={(event) => setExpectedStatusCode(event.target.value)}
+                      inputMode="numeric"
+                      className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                    />
+                  </div>
+
+                  <div className="sm:col-span-2">
+                    <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                      Expected response text <span className="font-normal">(optional)</span>
+                    </label>
+                    <input
+                      value={expectedBodyText}
+                      onChange={(event) => setExpectedBodyText(event.target.value)}
+                      className="h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-sm outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10"
+                      placeholder='e.g. "status":"ok"'
+                    />
+                  </div>
+
+                  {monitorType === "API" && (
+                    <>
+                      <div className="sm:col-span-2">
+                        <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                          Request headers JSON <span className="font-normal">(optional)</span>
+                        </label>
+                        <textarea
+                          value={requestHeadersJson}
+                          onChange={(event) => setRequestHeadersJson(event.target.value)}
+                          className={`${mono.className} min-h-[90px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3 text-xs outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                          placeholder='{"Authorization":"Bearer ..."}'
+                        />
+                      </div>
+                      {method !== "GET" && method !== "HEAD" && (
+                        <div className="sm:col-span-2">
+                          <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                            Request body <span className="font-normal">(optional)</span>
+                          </label>
+                          <textarea
+                            value={requestBody}
+                            onChange={(event) => setRequestBody(event.target.value)}
+                            className={`${mono.className} min-h-[90px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3 text-xs outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                            placeholder='{"ping":true}'
+                          />
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {monitorType === "TCP" && (
+                <div>
+                  <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                    Port
+                  </label>
+                  <input
+                    value={port}
+                    onChange={(event) => setPort(event.target.value)}
+                    inputMode="numeric"
+                    className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                    placeholder="443"
+                  />
+                </div>
+              )}
+
+              {monitorType === "DNS" && (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <PremiumSelect
+                    label="Record type"
+                    value={dnsRecordType}
+                    onChange={setDnsRecordType}
+                    options={dnsRecordOptions}
+                    icon={<Icon name="chart" size={16} />}
+                  />
+                  <div>
+                    <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                      Expected value <span className="font-normal">(optional)</span>
+                    </label>
+                    <input
+                      value={dnsExpectedValue}
+                      onChange={(event) => setDnsExpectedValue(event.target.value)}
+                      className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                      placeholder="1.2.3.4"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {monitorType === "SSL" && (
+                <div>
+                  <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                    Warning days before expiry
+                  </label>
+                  <input
+                    value={sslExpiryWarningDays}
+                    onChange={(event) => setSslExpiryWarningDays(event.target.value)}
+                    inputMode="numeric"
+                    className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                  />
+                </div>
+              )}
+
+              <div>
+                <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                  Timeout (seconds)
+                </label>
+                <input
+                  value={timeoutSeconds}
+                  onChange={(event) => setTimeoutSeconds(event.target.value)}
+                  inputMode="numeric"
+                  className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                />
               </div>
 
               <PremiumSelect
@@ -1858,7 +2282,7 @@ function PremiumSelect({
               <button
                 type="button"
                 onClick={() => void addMonitor()}
-                disabled={loading || !platformRunning}
+                disabled={loading || false}
                 className="flex h-11 items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 text-sm font-bold text-white transition-all hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Icon name="plus" size={16} />
@@ -1866,6 +2290,330 @@ function PremiumSelect({
                   ? "Creating…"
                   : "Create monitor"}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          EDIT MONITOR MODAL
+          ======================================================== */}
+
+      {editMonitor && (
+        <div
+          className="fixed inset-0 z-[300] flex items-center justify-center bg-black/55 p-4 backdrop-blur-md"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setEditMonitor(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-[520px] overflow-hidden rounded-2xl border border-[var(--pc-border)] bg-[var(--pc-surface)] shadow-[0_30px_100px_rgba(0,0,0,0.35)]">
+            <div className="flex items-center justify-between border-b border-[var(--pc-border)] px-5 py-4 sm:px-6">
+              <div>
+                <h2 className="text-base font-bold">
+                  Edit monitor
+                </h2>
+
+                <p className="mt-1 text-xs text-[var(--pc-muted)]">
+                  Update the name, endpoint or check interval.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setEditMonitor(null)}
+                className="flex h-9 w-9 items-center justify-center rounded-lg text-[var(--pc-muted)] hover:bg-[var(--pc-hover)] hover:text-[var(--pc-text)]"
+              >
+                <Icon name="x" size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-5 p-5 sm:p-6">
+              <div>
+                <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                  Monitor name
+                </label>
+
+                <input
+                  value={editName}
+                  onChange={(event) => setEditName(event.target.value)}
+                  className="h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-sm font-medium outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10"
+                  placeholder="Production API"
+                />
+              </div>
+
+              <PremiumSelect
+                label="Monitor type"
+                value={editMonitorType}
+                onChange={setEditMonitorType}
+                options={monitorTypeOptions}
+                icon={<Icon name="activity" size={16} />}
+              />
+
+              <div>
+                <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                  Target
+                </label>
+
+                <input
+                  value={editUrl}
+                  onChange={(event) => setEditUrl(event.target.value)}
+                  className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all placeholder:text-[var(--pc-muted)] focus:border-[#4C8DFF] focus:ring-4 focus:ring-[#4C8DFF]/10`}
+                  placeholder="https://example.com"
+                  type="url"
+                />
+              </div>
+
+              {(editMonitorType === "HTTP" || editMonitorType === "API") && (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <PremiumSelect
+                    label="HTTP method"
+                    value={editMethod}
+                    onChange={setEditMethod}
+                    options={methodOptions}
+                    icon={<Icon name="arrow" size={16} />}
+                  />
+                  <div>
+                    <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">
+                      Expected status
+                    </label>
+                    <input value={editExpectedStatusCode} onChange={(event) => setEditExpectedStatusCode(event.target.value)} inputMode="numeric" className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF]`} />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">Expected response text <span className="font-normal">(optional)</span></label>
+                    <input value={editExpectedBodyText} onChange={(event) => setEditExpectedBodyText(event.target.value)} className="h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-sm outline-none transition-all focus:border-[#4C8DFF]" />
+                  </div>
+                  {editMonitorType === "API" && (
+                    <>
+                      <div className="sm:col-span-2">
+                        <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">Request headers JSON <span className="font-normal">(optional)</span></label>
+                        <textarea value={editRequestHeadersJson} onChange={(event) => setEditRequestHeadersJson(event.target.value)} className={`${mono.className} min-h-[90px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3 text-xs outline-none transition-all focus:border-[#4C8DFF]`} />
+                      </div>
+                      {editMethod !== "GET" && editMethod !== "HEAD" && (
+                        <div className="sm:col-span-2">
+                          <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">Request body <span className="font-normal">(optional)</span></label>
+                          <textarea value={editRequestBody} onChange={(event) => setEditRequestBody(event.target.value)} className={`${mono.className} min-h-[90px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 py-3 text-xs outline-none transition-all focus:border-[#4C8DFF]`} />
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+              {editMonitorType === "TCP" && (
+                <div>
+                  <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">Port</label>
+                  <input value={editPort} onChange={(event) => setEditPort(event.target.value)} inputMode="numeric" className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF]`} />
+                </div>
+              )}
+              {editMonitorType === "DNS" && (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <PremiumSelect label="Record type" value={editDnsRecordType} onChange={setEditDnsRecordType} options={dnsRecordOptions} icon={<Icon name="chart" size={16} />} />
+                  <div>
+                    <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">Expected value <span className="font-normal">(optional)</span></label>
+                    <input value={editDnsExpectedValue} onChange={(event) => setEditDnsExpectedValue(event.target.value)} className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF]`} />
+                  </div>
+                </div>
+              )}
+              {editMonitorType === "SSL" && (
+                <div>
+                  <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">Warning days before expiry</label>
+                  <input value={editSslExpiryWarningDays} onChange={(event) => setEditSslExpiryWarningDays(event.target.value)} inputMode="numeric" className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF]`} />
+                </div>
+              )}
+              <div>
+                <label className="mb-2 block text-[12px] font-semibold text-[var(--pc-muted)]">Timeout (seconds)</label>
+                <input value={editTimeoutSeconds} onChange={(event) => setEditTimeoutSeconds(event.target.value)} inputMode="numeric" className={`${mono.className} h-[54px] w-full rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] px-4 text-xs outline-none transition-all focus:border-[#4C8DFF]`} />
+              </div>
+
+              <PremiumSelect
+                label="Check interval"
+                value={editCheckInterval}
+                onChange={setEditCheckInterval}
+                options={intervalOptions}
+                icon={<Icon name="clock" size={16} />}
+              />
+            </div>
+
+            <div className="flex flex-col-reverse gap-2 border-t border-[var(--pc-border)] p-5 sm:flex-row sm:justify-end sm:px-6">
+              <button
+                type="button"
+                onClick={() => setEditMonitor(null)}
+                className="h-11 rounded-xl border border-[var(--pc-border)] px-5 text-sm font-semibold text-[var(--pc-muted)] transition-colors hover:border-[var(--pc-border-hover)] hover:text-[var(--pc-text)]"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void saveEditMonitor()}
+                disabled={loading}
+                className="flex h-11 items-center justify-center gap-2 rounded-xl bg-[#4C8DFF] px-5 text-sm font-bold text-white transition-all hover:bg-[#3E7CE8] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Icon name="check" size={16} />
+                {loading ? "Saving…" : "Save changes"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          MONITOR DETAIL DRAWER
+          ======================================================== */}
+
+      {viewMonitor && (
+        <div
+          className="fixed inset-0 z-[300] flex justify-end bg-black/55 backdrop-blur-md"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeDetail();
+          }}
+        >
+          <div className="flex h-full w-full max-w-[640px] flex-col border-l border-[var(--pc-border)] bg-[var(--pc-surface)] shadow-[0_0_100px_rgba(0,0,0,0.45)]">
+            <div className="flex items-center justify-between border-b border-[var(--pc-border)] px-5 py-4 sm:px-6">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span
+                    className="h-2.5 w-2.5 shrink-0 rounded-full"
+                    style={{
+                      backgroundColor:
+                        getStatus(viewMonitor) === "up"
+                          ? "#34D399"
+                          : getStatus(viewMonitor) === "down"
+                            ? "#FB5B5B"
+                            : getStatus(viewMonitor) === "unknown"
+                              ? "#E8B94A"
+                              : "#7C8699",
+                    }}
+                  />
+                  <h2 className="truncate text-base font-bold">{viewMonitor.name}</h2>
+                </div>
+                <p className={`${mono.className} mt-1 truncate text-[11px] text-[var(--pc-muted)]`}>
+                  {viewMonitor.url}
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={closeDetail}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-[var(--pc-muted)] hover:bg-[var(--pc-hover)] hover:text-[var(--pc-text)]"
+              >
+                <Icon name="x" size={18} />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-6 overflow-y-auto p-5 sm:p-6">
+              {/* uptime */}
+              <div className="grid grid-cols-3 gap-3">
+                {[
+                  ["24h", uptimeForWindow(checksHistory, 24)],
+                  ["7d", uptimeForWindow(checksHistory, 24 * 7)],
+                  ["30d", uptimeForWindow(checksHistory, 24 * 30)],
+                ].map(([label, value]) => (
+                  <div
+                    key={label as string}
+                    className="rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] p-4"
+                  >
+                    <p className="text-[11px] font-medium text-[var(--pc-muted)]">Uptime · {label}</p>
+                    <p className={`${mono.className} mt-1 text-xl font-semibold`}>
+                      {value == null ? "—" : `${value}%`}
+                    </p>
+                  </div>
+                ))}
+              </div>
+
+              {/* response time chart */}
+              <div className="rounded-xl border border-[var(--pc-border)] bg-[var(--pc-input)] p-4">
+                <p className="mb-2 text-[11px] font-medium text-[var(--pc-muted)]">
+                  Response time — last {Math.min(checksHistory.length, 50)} checks
+                </p>
+                {detailLoading ? (
+                  <div className="flex h-32 items-center justify-center text-xs text-[var(--pc-muted)]">
+                    Loading…
+                  </div>
+                ) : (
+                  <ResponseTimeChart
+                    points={[...checksHistory]
+                      .slice(0, 50)
+                      .reverse()
+                      .map((check) => ({ y: check.responseTime ?? null }))}
+                  />
+                )}
+              </div>
+
+              {/* incidents */}
+              <div>
+                <p className="mb-3 text-xs font-bold uppercase tracking-[0.1em] text-[var(--pc-muted)]">
+                  Incident history
+                </p>
+
+                {incidentsHistory.length === 0 ? (
+                  <p className="text-sm text-[var(--pc-muted)]">
+                    No incidents recorded for this monitor.
+                  </p>
+                ) : (
+                  <div className="divide-y divide-[var(--pc-border)] overflow-hidden rounded-xl border border-[var(--pc-border)]">
+                    {incidentsHistory.map((incident) => (
+                      <div
+                        key={incident.id}
+                        className="flex items-center justify-between gap-3 bg-[var(--pc-input)] p-4"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold">
+                            {incident.reason || "Service unreachable"}
+                          </p>
+                          <p className={`${mono.className} mt-1 text-[11px] text-[var(--pc-muted)]`}>
+                            {new Date(incident.startedAt).toLocaleString()}
+                          </p>
+                        </div>
+                        <div className="shrink-0 text-right">
+                          <span
+                            className={`inline-block rounded-md px-2 py-1 text-[10px] font-bold uppercase tracking-wide ${
+                              incident.status === "OPEN"
+                                ? "bg-[#FB5B5B]/10 text-[#FB5B5B]"
+                                : "bg-[#34D399]/10 text-[#34D399]"
+                            }`}
+                          >
+                            {incident.status === "OPEN" ? "Ongoing" : "Resolved"}
+                          </span>
+                          <p className={`${mono.className} mt-1 text-[11px] text-[var(--pc-muted)]`}>
+                            {formatDuration(incident.duration)}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* recent checks */}
+              <div>
+                <p className="mb-3 text-xs font-bold uppercase tracking-[0.1em] text-[var(--pc-muted)]">
+                  Recent checks
+                </p>
+                <div className="max-h-72 divide-y divide-[var(--pc-border)] overflow-y-auto rounded-xl border border-[var(--pc-border)]">
+                  {checksHistory.slice(0, 30).map((check) => (
+                    <div
+                      key={check.id}
+                      className="flex items-center justify-between gap-3 bg-[var(--pc-input)] px-4 py-2.5"
+                    >
+                      <span className={`${mono.className} text-[11px] text-[var(--pc-muted)]`}>
+                        {new Date(check.checkedAt).toLocaleString()}
+                      </span>
+                      <span
+                        className={`${mono.className} text-[11px] font-semibold`}
+                        style={{ color: check.status === "UP" ? "#34D399" : "#FB5B5B" }}
+                      >
+                        {check.status}
+                        {check.statusCode ? ` · ${check.statusCode}` : ""}
+                      </span>
+                      <span className={`${mono.className} text-[11px] text-[var(--pc-muted)]`}>
+                        {check.responseTime != null ? `${check.responseTime}ms` : "—"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -2147,7 +2895,7 @@ function PremiumSelect({
 
       {fullscreen && (
         <div className="fixed bottom-5 left-1/2 z-[100] -translate-x-1/2 rounded-full border border-[var(--pc-border)] bg-[var(--pc-surface)] px-4 py-2 text-[11px] font-medium text-[var(--pc-muted)] shadow-[var(--pc-shadow)]">
-          Fullscreen monitoring view
+          NOC View · press Esc to exit
         </div>
       )}
     </main>
